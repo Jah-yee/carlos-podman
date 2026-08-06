@@ -1,0 +1,600 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Validation gates — the within-instance rules mirror carlos_ctl/validate.py
+# (play re-checks them at runtime); the CROSS-instance collision checks live
+# ONLY here, replacing the bash registry-walking checker: the playbook sees
+# every instance's host_vars at once, so colliding ports/homes/names are
+# refused before any mutation.
+---
+- name: Instance name uses the safe charset (systemd units, pods, nft table derive from it)
+  ansible.builtin.assert:
+    # First char must be a LETTER, not a digit: nftables identifiers must
+    # begin alphabetic, so `table ip 2ndclinic-nat` fails `nft -f` parsing —
+    # after directories, units, and quadlets were already provisioned. This
+    # gate exists to catch exactly that class of late failure up front.
+    that: carlos_instance is match('^[a-z][a-z0-9-]*$')
+    fail_msg: >-
+      carlos_instance='{{ carlos_instance }}' — must start with a lowercase
+      letter, then lowercase letters, digits, and '-' only (it names systemd
+      units, pods, and the nftables table; nft identifiers cannot start with
+      a digit)
+
+- name: carlos_emr_home is an absolute, non-root path (chowns/sweeps recurse under it)
+  ansible.builtin.assert:
+    that:
+      - carlos_emr_home is match('^/.+')
+      - carlos_emr_home != '/'
+      - not carlos_emr_home.endswith('/')
+      - not (carlos_emr_home is search('\\s'))
+      - "'%' not in carlos_emr_home"
+    fail_msg: >-
+      carlos_emr_home='{{ carlos_emr_home }}' — must be an absolute path, not
+      '/', with no trailing slash, whitespace, or '%'. The role creates
+      directory trees, chowns recursively, and (at uninstall) removes wiring
+      under this prefix; a relative or root value would act on the wrong tree.
+      A space makes systemd word-split 'Environment=EMR_HOME=...' into a
+      different, nonexistent home; a '%' is systemd specifier-expanded — both
+      silently point every timer/guard/alert unit at the wrong tree.
+
+- name: carlos_service_user_home, when set, is absolute and not under /run
+  # /run is the one prefix with no escape hatch: podman's rootless netns
+  # replaces it UNCONDITIONALLY (`mount(runDir, "/run", MS_BIND|MS_REC)`), so a
+  # home there can never work — and it is tmpfs anyway, so an engine store
+  # would not survive a reboot. /var/lib is deliberately NOT refused here: it
+  # is masked only when /var/lib/cni is absent, and tasks/host.yml creates that
+  # directory, which is what keeps existing /var/lib/<user> installs working.
+  ansible.builtin.assert:
+    that:
+      - carlos_service_user_home is match('^/.+')
+      - not (carlos_service_user_home ~ '/') is match('^/run/')
+      - not (carlos_service_user_home ~ '/') is match('^/var/run/')
+    fail_msg: >-
+      carlos_service_user_home='{{ carlos_service_user_home }}' — must be an
+      absolute path, and never under /run (or /var/run): the rootless engine
+      owner's home is the parent of podman's GRAPHROOT
+      ($HOME/.local/share/containers/storage), and podman's rootless network
+      namespace replaces /run unconditionally, so <graphroot>/networks would be
+      invisible to netavark inside the namespace that has to resolve it —
+      every named bridge network then fails with 'unable to find network with
+      name or ID <net>: network not found' and no pod can start. /run is also
+      tmpfs, so the engine store would not survive a reboot.
+  when: carlos_service_user_home | default('', true) | length > 0
+
+- name: carlos_db_root_password is set (renders carlos.properties + the db secret)
+  ansible.builtin.assert:
+    that: carlos_db_root_password | length > 0
+    fail_msg: >-
+      carlos_db_root_password is empty — set it in host_vars (vault it:
+      ansible-vault encrypt_string --name carlos_db_root_password)
+  no_log: true
+
+# CR/C0-control parity with the CLI's validate_db_password: a CR-bearing
+# (Windows-pasted) value passes a newline-only check but then corrupts three
+# stores three different ways — Java Properties.load treats CR as a line
+# terminator (app reads a truncated password), the fresh-datadir bootstrap
+# secret hashes the FULL value (DB root differs from what the app sends),
+# and parse_env_file's splitlines() splits the rendered env line in two.
+- name: db root password carries no control characters (line-oriented credential stores)
+  ansible.builtin.assert:
+    that: carlos_db_root_password is not regex('[\x00-\x1f\x7f]')
+    fail_msg: >-
+      the MariaDB root password must not contain newline, carriage-return, or
+      other control characters — they truncate or split the rendered
+      credential stores (carlos.properties / carlos-app.env / the db secret)
+      in ways that desync the app, the CLI, and the database
+  no_log: true
+
+# Deliberately NOT no_log: this assert fails only when the value is EMPTY, and
+# ansible's assert failure output renders the assertion text and fail_msg,
+# never the evaluated value — so there is nothing to censor, and no_log would
+# hide the remediation guidance below ("output has been hidden") exactly when
+# the operator needs it.
+- name: carlos_encryption_secret_key is set (develop fail-fast boot needs it pre-provisioned)
+  ansible.builtin.assert:
+    that: carlos_encryption_secret_key | length > 0
+    fail_msg: >-
+      carlos_encryption_secret_key is empty — generate one (openssl rand -base64 32)
+      and set it in host_vars (vault it like the db password). Current CARLOS
+      develop fails first boot without a pre-provisioned key: the app tries to
+      generate one and persist it into carlos.properties, which this
+      deployment mounts read-only.
+
+# Shape gate, same class of guard as the db password's no-newline assert and
+# carlos-app.env.j2's pattern gate: the key renders into the line-oriented
+# Java properties file AFTER db_username/db_password/db_uri, where an embedded
+# newline would inject property lines that win under last-one-wins, a stray
+# backslash can throw Properties.load or line-continue into the next line, and
+# whitespace breaks Base64.decode at boot. Enforcing the documented base64
+# alphabet subsumes all three. no_log stays ON here: a failure message for a
+# malformed value is the one place a fragment of the secret could plausibly be
+# echoed by future edits.
+- name: carlos_encryption_secret_key is plain single-line base64 (renders into java properties)
+  ansible.builtin.assert:
+    # \Z, not $: python's $ also matches just before a single TRAILING
+    # newline, which would let a "key\n" value through the gate. The length
+    # check catches paste-truncation (java's strict Base64.decode rejects
+    # length % 4 != 0 at boot — fail here, not there).
+    that:
+      - carlos_encryption_secret_key is match('^[A-Za-z0-9+/]+={0,2}\Z')
+      - (carlos_encryption_secret_key | length) % 4 == 0
+    fail_msg: >-
+      carlos_encryption_secret_key must be a single-line base64 string
+      (openssl rand -base64 32) — no newlines, whitespace, backslashes,
+      truncation, or quoting artifacts. If vaulting it, note a raw
+      `openssl ... | ansible-vault encrypt_string` pipe preserves the
+      trailing newline — pipe through printf '%s' first.
+  no_log: true
+
+- name: BIND_IP is a specific IPv4 (the nftables 'ip daddr' gate is IPv4-only)
+  ansible.builtin.assert:
+    that:
+      - carlos_bind_ip is ansible.utils.ipv4
+      - carlos_bind_ip != '0.0.0.0' or (carlos_allow_any_bind | default(false) | bool)
+    fail_msg: >-
+      carlos_bind_ip='{{ carlos_bind_ip }}' — must be a specific IPv4 address.
+      0.0.0.0 makes the nftables gate a no-op while services bind ALL
+      interfaces (the PHI log view would be internet-reachable behind only
+      shared basic-auth); set carlos_allow_any_bind: true to accept that on
+      purpose.
+
+- name: LOG_VIEW_ALLOW_CIDR is a valid IPv4 CIDR set (fail-closed nft input)
+  ansible.builtin.assert:
+    that: >-
+      carlos_log_view_allow_cidr == '' or carlos_log_view_allow_cidr == 'rfc1918'
+      or (carlos_log_view_allow_cidr | replace('{','') | replace('}','')
+          | split(',') | map('trim') | select('!=', '')
+          | map('ansible.utils.ipv4') | reject | list | length == 0)
+    fail_msg: >-
+      carlos_log_view_allow_cidr='{{ carlos_log_view_allow_cidr }}' is not a
+      valid IPv4 CIDR (or comma/brace set), e.g. 10.0.0.0/24, or the literal
+      'rfc1918' — a malformed value would fail the nftables apply and leave
+      the PHI log view unfiltered
+
+- name: Host-firewall SSH port is a valid TCP port before a default-deny is applied
+  # The default-deny input chain always emits `tcp dport <ssh_port> accept`, so
+  # the ONLY way to lock yourself out via SSH is a malformed/empty port value
+  # (which would render an nft rule that fails to load, leaving the drop policy
+  # with no SSH allow). Fail the playbook here instead of on the box.
+  ansible.builtin.assert:
+    that:
+      - carlos_host_firewall_ssh_port | int | string == carlos_host_firewall_ssh_port | string
+      - carlos_host_firewall_ssh_port | int >= 1
+      - carlos_host_firewall_ssh_port | int <= 65535
+    fail_msg: >-
+      carlos_host_firewall_ssh_port='{{ carlos_host_firewall_ssh_port }}' is not a
+      valid TCP port (1-65535) — the host firewall is enabled and its allow set
+      keys on this port; a bad value would drop your own SSH management plane.
+  when: carlos_host_firewall_enabled | default(false) | bool
+
+- name: Billing province is one CARLOS implements (billregion renders from it)
+  # carlos.properties' billregion drives provincial billing; ON and BC are
+  # the provinces CARLOS implements (generic = no provincial billing). A
+  # typo'd/empty value would render a broken billregion and surface as
+  # billing failures deep in the app.
+  ansible.builtin.assert:
+    that: carlos_billing_province | default('ON', true) in ['ON', 'BC', 'generic']
+    fail_msg: >-
+      carlos_billing_province='{{ carlos_billing_province }}' — must be one of
+      ON, BC, or generic (the provinces CARLOS implements billing for);
+      billregion in carlos.properties renders from this value.
+
+- name: acme mode requires a real SERVER_NAME (HTTP-01 must resolve to this host)
+  # The shipped default carlos_server_name is the documentation placeholder
+  # emr.example.ca — in acme mode certbot would request a Let's Encrypt cert
+  # for a domain the operator does not control (and fail HTTP-01, burning
+  # rate limit). Refuse before any host mutation.
+  ansible.builtin.assert:
+    that: carlos_server_name != 'emr.example.ca'
+    fail_msg: >-
+      carlos_tls_mode is 'acme' but carlos_server_name is still the
+      placeholder 'emr.example.ca' — set it to the real public DNS name that
+      resolves to this host (Let's Encrypt HTTP-01 validates against it).
+  when: carlos_tls_mode | default('selfsigned', true) == 'acme'
+
+# The obs store credential and usernames render RAW into holders that break on
+# the wrong char: the TOML basic string in journald-collector.toml, the
+# `curl -K -` config the store probes use, and the whitespace-delimited Caddy
+# basic_auth token. Reject (denylist, not allowlist — an existing valid value
+# like admin@clinic must keep working) the characters that actually corrupt
+# those renders. The runtime CLI (curl_config_quote / validate_db_password)
+# enforces the same at rotate/render time; this is the playbook-time gate.
+- name: obs HTTP username renders into TOML/curl without a hostile character
+  ansible.builtin.assert:
+    that: not (carlos_obs_http_user is search('[\":\\\\]'))
+    fail_msg: >-
+      carlos_obs_http_user='{{ carlos_obs_http_user }}' contains a double quote,
+      colon, or backslash — it renders raw into journald-collector.toml (a TOML
+      basic string), the store-probe curl config, and a `user:pass` HTTP basic
+      credential. RFC 7617 splits basic auth on the FIRST colon, so a colon in
+      the username silently moves part of it into the password and every store
+      client (vmagent, vector, Caddy, vmalert) 401s. Use a
+      quote/colon/backslash-free username.
+  when: carlos_obs_enabled | bool
+
+- name: log-view username is a single whitespace-free Caddy basic_auth token
+  ansible.builtin.assert:
+    that:
+      - not (carlos_log_view_user is search('[\"\\\\]'))
+      - not (carlos_log_view_user is search('\\s'))
+    fail_msg: >-
+      carlos_log_view_user='{{ carlos_log_view_user }}' contains whitespace, a
+      double quote, or a backslash — the Caddyfile basic_auth directive is a
+      whitespace-delimited token, so any of these breaks the log-view auth
+      block. Use a single unquoted token.
+  when: carlos_obs_enabled | bool
+
+- name: obs HTTP password can ride the TOML/curl/file holders it renders into
+  # Deliberately does NOT interpolate the value into fail_msg (the house
+  # var='{{ var }}' pattern is skipped for a secret — a failed assert's message
+  # lands in job logs). A double quote or backslash breaks the TOML basic
+  # string and the curl -K config; validate_db_password rejects the same at
+  # rotate time. A value that was silently corrupting the render before is
+  # surfaced here — rotate it rather than persisting the broken value.
+  ansible.builtin.assert:
+    that: not (carlos_obs_http_password is search('[\"\\\\]'))
+    fail_msg: >-
+      carlos_obs_http_password contains a double quote or backslash, which
+      corrupts the TOML/curl config it renders into (the value is not echoed
+      here). Choose an obs password without those characters.
+  when: carlos_obs_enabled | bool and (carlos_obs_http_password | default('', true)) | length > 0
+
+# C0-control parity with the CLI's rotate-obs validation (pass-8 M3, same
+# class as the db-root assert above): a pasted newline/tab passes the
+# quote/backslash check but renders a literal control character inside the
+# TOML basic string journald-collector.toml.j2 emits — the log collector
+# then crash-loops at config load on a provisioned PHI instance, stalling
+# log shipping. Same no-value-in-fail_msg discipline as the sibling assert.
+- name: obs HTTP password carries no control characters (TOML/curl-config holders)
+  ansible.builtin.assert:
+    that: carlos_obs_http_password is not regex('[\x00-\x1f\x7f]')
+    fail_msg: >-
+      carlos_obs_http_password contains control characters (newline, tab,
+      carriage-return, ...) — they corrupt the rendered TOML/curl holders and
+      crash-loop the log collector (the value is not echoed here). Choose an
+      obs password without control characters, matching what
+      'carlos-ctl rotate obs' enforces.
+  when: carlos_obs_enabled | bool and (carlos_obs_http_password | default('', true)) | length > 0
+
+# CONTROL-NODE probe (not a target check): the log-view Caddyfile render hashes
+# the log-view password with password_hash('bcrypt'), which runs HERE on the
+# controller via passlib. passlib 1.7.4 reads bcrypt.__about__.__version__,
+# removed in bcrypt >= 4.1 — so a modern `pip install passlib` (which pulls
+# bcrypt 5.x) makes that render fail MID-PLAY inside a no_log task, surfacing
+# as an opaque censored failure. Fail fast here, outside no_log, with the fix.
+# Only relevant when the obs profile is on (the sole password_hash consumer).
+- name: Verify the control node can bcrypt-hash (passlib/bcrypt compatibility)
+  when: carlos_obs_enabled | bool
+  block:
+    - name: Probe password_hash('bcrypt') on the control node
+      ansible.builtin.set_fact:
+        _bcrypt_probe: "{{ 'carlos-bcrypt-probe' | password_hash('bcrypt') }}"
+      check_mode: false
+  rescue:
+    - name: Explain the passlib/bcrypt incompatibility and the pin
+      ansible.builtin.fail:
+        msg: >-
+          password_hash('bcrypt') FAILED on the control node — this is almost
+          always passlib 1.7.4 with bcrypt >= 4.1 (passlib probes an attribute
+          bcrypt removed). Pin the controller's bcrypt: pip install 'bcrypt<4.1'
+          (alongside ansible-core/passlib/netaddr), then re-run. Without this
+          the obs log-view Caddyfile render fails mid-play inside a no_log task
+          (an opaque 'censored' failure).
+
+- name: Probe podman and systemd versions (documented floors — README Requirements)
+  # README requires podman >= 4.9 (kube play with secrets/init containers,
+  # cross-pod aardvark DNS, healthcheck wiring for the pod livenessProbes) and
+  # systemd >= 248 (systemctl --user -M <user>@ remote user-manager control,
+  # LoadCredentialEncrypted). Those floors were previously prose-only: an old
+  # runtime deployed fine and failed later in opaque, version-shaped ways
+  # (probes never wired -> readiness degraded, kube play rejecting the specs).
+  # Probe here, assert below; opt out with carlos_allow_old_runtime: true.
+  ansible.builtin.command:
+    cmd: "{{ item }} --version"
+  register: _runtime_version_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  loop:
+    - podman
+    - systemctl
+
+- name: Refuse a podman/systemd older than the documented floor
+  ansible.builtin.assert:
+    that:
+      # `podman --version` -> "podman version 4.9.3"; `systemctl --version`
+      # -> "systemd 252 (252.x)". A probe that failed outright (rc != 0) or
+      # prints something unparseable passes here — tool PRESENCE is asserted
+      # elsewhere and an unknown format must not hard-fail a working host.
+      - >-
+        _runtime_version_probe.results[0].rc != 0
+        or (_runtime_version_probe.results[0].stdout
+            | regex_search('([0-9]+)[.]([0-9]+)') is none)
+        or (_runtime_version_probe.results[0].stdout
+            | regex_search('([0-9]+)[.]([0-9]+)', '\\1') | first | int > 4)
+        or ((_runtime_version_probe.results[0].stdout
+             | regex_search('([0-9]+)[.]([0-9]+)', '\\1') | first | int == 4)
+            and (_runtime_version_probe.results[0].stdout
+                 | regex_search('([0-9]+)[.]([0-9]+)', '\\2') | first | int >= 9))
+        or (carlos_allow_old_runtime | default(false) | bool)
+      - >-
+        _runtime_version_probe.results[1].rc != 0
+        or (_runtime_version_probe.results[1].stdout
+            | regex_search('systemd ([0-9]+)') is none)
+        or (_runtime_version_probe.results[1].stdout
+            | regex_search('systemd ([0-9]+)', '\\1') | first | int >= 248)
+        or (carlos_allow_old_runtime | default(false) | bool)
+    fail_msg: >-
+      podman/systemd on {{ inventory_hostname }} is older than the documented
+      floor (podman >= 4.9, systemd >= 248 — see README Requirements):
+      podman probe '{{ _runtime_version_probe.results[0].stdout | default('') | trim }}',
+      systemd probe '{{ _runtime_version_probe.results[1].stdout | default('') | trim }}'.
+      Old runtimes fail in version-shaped ways AFTER deploy (livenessProbes never
+      wired into healthchecks, kube play rejecting secret/init-container specs,
+      systemctl --user -M unsupported). Upgrade the host, or set
+      carlos_allow_old_runtime: true to accept the risk knowingly.
+
+- name: Probe SELinux enforcement (rootless podman volume labels are not managed here)
+  # The pod specs bind host directories without :z/:Z relabeling and the role
+  # does not run semanage/chcon — on an ENFORCING SELinux host the containers
+  # are denied access to their mounts and fail to start with opaque AVC denials.
+  # Fail fast with the workaround instead of a mystery boot loop. Opt out with
+  # carlos_accept_selinux: true once the operator has labeled the tree by hand.
+  ansible.builtin.command:
+    cmd: getenforce
+  register: _selinux_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Refuse an enforcing SELinux host unless explicitly accepted
+  ansible.builtin.assert:
+    that:
+      - (_selinux_probe.stdout | default('') | trim) != 'Enforcing'
+        or (carlos_accept_selinux | default(false) | bool)
+    fail_msg: >-
+      SELinux is Enforcing on {{ inventory_hostname }} and this role does not
+      relabel the bind-mounted volumes (no :z/:Z, no semanage) — the containers
+      will be denied access to their mounts. Either set SELinux to permissive
+      for these paths (chcon -Rt container_file_t {{ carlos_emr_home }}) or set
+      carlos_accept_selinux: true once you have labeled the tree by hand.
+
+- name: Collect this instance's port set
+  ansible.builtin.set_fact:
+    _carlos_all_ports:
+      - "{{ carlos_https_port | int }}"
+      - "{{ carlos_https_publish_port | int }}"
+      # acme HTTP-01: nft DNATs :80 here and certbot binds it rootlessly.
+      # Validated in EVERY tls mode (it is a defined default either way), so
+      # a later switch to acme cannot surface a collision the gate blessed.
+      - "{{ carlos_http_publish_port | int }}"
+      - "{{ carlos_victorialogs_port | int }}"
+      - "{{ carlos_victoriametrics_port | int }}"
+      - "{{ carlos_log_view_port | int }}"
+      - "{{ carlos_pma_port | int }}"
+      - "{{ carlos_vmalert_port | int }}"
+    _carlos_rootless_ports:
+      - "{{ carlos_https_publish_port | int }}"
+      - "{{ carlos_http_publish_port | int }}"
+      - "{{ carlos_log_view_port | int }}"
+      - "{{ carlos_victorialogs_port | int }}"
+      - "{{ carlos_victoriametrics_port | int }}"
+      - "{{ carlos_pma_port | int }}"
+      - "{{ carlos_vmalert_port | int }}"
+
+- name: Every published port is valid and unique within the instance
+  ansible.builtin.assert:
+    that:
+      - _carlos_all_ports | map('int') | select('lt', 1) | list | length == 0
+      - _carlos_all_ports | map('int') | select('gt', 65535) | list | length == 0
+      # HTTPS_PORT == HTTPS_PUBLISH_PORT would make the nft redirect a no-op,
+      # and duplicated listener ports cannot both bind.
+      - _carlos_all_ports | unique | length == _carlos_all_ports | length
+    fail_msg: >-
+      port set {{ _carlos_all_ports }} — every port must be 1-65535 and
+      unique within an instance
+
+- name: Vmalert's in-pod listen port avoids its pod-mates' fixed listeners
+  # vmalert is the one obs container whose IN-POD listen address is templated
+  # from its host-port variable (-httpListenAddr=:{{ carlos_vmalert_port }});
+  # victoria-metrics (:8428), victorialogs (:9428), node-exporter (:9100) and
+  # caddy (:9443) bind FIXED in-pod ports regardless of their host-port vars.
+  # The uniqueness assert above only compares the VARIABLES, so e.g.
+  # carlos_vmalert_port: 8428 with carlos_victoriametrics_port moved elsewhere
+  # passes it — then vmalert (or its neighbour) fails to bind in the shared
+  # netns and crash-loops, taking metric-derived alerting down.
+  ansible.builtin.assert:
+    that: carlos_vmalert_port | int not in [8428, 9428, 9100, 9443]
+    fail_msg: >-
+      carlos_vmalert_port={{ carlos_vmalert_port }} collides with a fixed
+      in-pod obs listener (victoria-metrics :8428, victorialogs :9428,
+      node-exporter :9100, caddy :9443) — pick a different port
+  when: carlos_obs_enabled | bool
+
+- name: Rootless-published ports are >= 1024 (unprivileged engine cannot bind lower)
+  ansible.builtin.assert:
+    that: _carlos_rootless_ports | map('int') | select('lt', 1024) | list | length == 0
+    fail_msg: >-
+      a rootless-published port in {{ _carlos_rootless_ports }} is below 1024
+      — only carlos_https_port may be privileged (root installs the nftables
+      redirect)
+
+# --- cross-instance collisions (all instances targeting the same machine) -------
+# Each instance is an inventory host; instances sharing a physical machine
+# share ansible_host. Every listener is compared as ONE (address, port) set —
+# with the default bind_ip of 127.0.0.1 the loopback and BIND_IP groups share
+# an address, so a cross-group clash (one instance's publish port == another's
+# pma port) is just as real as a same-group one and must be refused too.
+#
+# Sibling fallbacks come from the role's OWN defaults file (hostvars of a
+# sibling do not include role defaults) — loaded once here so a changed
+# default can never drift apart from the collision check's assumptions.
+- name: Load the role defaults as the sibling fallback map (single source of truth)
+  ansible.builtin.set_fact:
+    _role_defaults: "{{ lookup('file', role_path ~ '/defaults/main.yml') | from_yaml }}"
+
+- name: Cross-check sibling instances on the same machine
+  ansible.builtin.assert:
+    that:
+      - hostvars[item]['carlos_emr_home'] | default(_role_defaults.carlos_emr_home) != carlos_emr_home
+      - not (hostvars[item]['carlos_instance'] | default(_role_defaults.carlos_instance)).startswith(carlos_instance ~ '-')
+      - not carlos_instance.startswith((hostvars[item]['carlos_instance'] | default(_role_defaults.carlos_instance)) ~ '-')
+      - hostvars[item]['carlos_instance'] | default(_role_defaults.carlos_instance) != carlos_instance
+    fail_msg: >-
+      instance '{{ carlos_instance }}' collides with sibling
+      '{{ hostvars[item]['carlos_instance'] | default(_role_defaults.carlos_instance) }}' on
+      {{ ansible_host | default(inventory_hostname) }}: every instance needs
+      its OWN carlos_emr_home and a non-prefix-overlapping name
+      ($INSTANCE-* unit globs would cross-match)
+  loop: "{{ groups['all'] | difference([inventory_hostname]) }}"
+  when:
+    - hostvars[item]['ansible_host'] | default(item) == ansible_host | default(inventory_hostname)
+
+# Instances that share the machine AND the service user share ONE rootless
+# podman engine and image store: `carlos-ctl build` in either instance
+# mutates the SAME localhost/... :latest and :previous tags, so a divergent
+# carlos_ref/carlos_image between them means instance A's build silently
+# becomes what instance B deploys at its next play/reboot — and A's next
+# build destroys B's one-command rollback target. Same-engine siblings must
+# agree on the image identity (or isolate with per-instance service users).
+- name: Same-engine siblings agree on image identity (shared image store)
+  ansible.builtin.assert:
+    that:
+      - >-
+        (hostvars[item]['carlos_image'] | default(_role_defaults.carlos_image))
+        == carlos_image
+      - >-
+        (hostvars[item]['carlos_drugref_image'] | default(_role_defaults.carlos_drugref_image))
+        == carlos_drugref_image
+      - >-
+        (hostvars[item]['carlos_ref'] | default(_role_defaults.carlos_ref))
+        == carlos_ref
+      - >-
+        (hostvars[item]['carlos_drugref_ref'] | default(_role_defaults.carlos_drugref_ref))
+        == carlos_drugref_ref
+    fail_msg: >-
+      instance '{{ carlos_instance }}' shares service user
+      '{{ carlos_service_user }}' (one podman engine / image store) with
+      sibling
+      '{{ hostvars[item]['carlos_instance'] | default(_role_defaults.carlos_instance) }}'
+      on {{ ansible_host | default(inventory_hostname) }} but disagrees on
+      carlos_image/carlos_drugref_image/carlos_ref/carlos_drugref_ref — a
+      `build` in one instance would silently retag what the other runs
+      (carlos-ctl build builds BOTH images from the per-instance refs). Align
+      the image vars, or give each instance its own carlos_service_user.
+  loop: "{{ groups['all'] | difference([inventory_hostname]) }}"
+  when:
+    - hostvars[item]['ansible_host'] | default(item) == ansible_host | default(inventory_hostname)
+    - >-
+      (hostvars[item]['carlos_service_user'] | default(_role_defaults.carlos_service_user))
+      == carlos_service_user
+
+# The journald SystemMaxUse drop-in is ONE host-global file
+# (/etc/systemd/journald.conf.d/carlos-max-use.conf) written by every
+# instance's play from its own carlos_journald_max_use: unlike the other
+# host-global resources (throttled service user, flock-guarded subuid grant,
+# single-owner hostfw assert) it has no cross-instance guard, so differing
+# values would make each play rewrite the file and restart journald forever,
+# with the effective disk cap being whichever instance ran last (and a ""
+# on one instance silently DELETING the other's disk-safety bound each run).
+# Refuse the disagreement up front instead.
+- name: Journald cap agrees across instances sharing the machine (host-global drop-in)
+  ansible.builtin.assert:
+    that: >-
+      (hostvars[item]['carlos_journald_max_use']
+       | default(_role_defaults.carlos_journald_max_use) | string)
+      == (carlos_journald_max_use | string)
+    fail_msg: >-
+      carlos_journald_max_use='{{ carlos_journald_max_use }}' differs from
+      sibling instance
+      '{{ hostvars[item]['carlos_instance'] | default(_role_defaults.carlos_instance) }}'
+      on {{ ansible_host | default(inventory_hostname) }} — the SystemMaxUse
+      drop-in is host-global; set the SAME value (or the same emptiness) on
+      every instance that shares this machine.
+  loop: "{{ groups['all'] | difference([inventory_hostname]) }}"
+  when:
+    - hostvars[item]['ansible_host'] | default(item) == ansible_host | default(inventory_hostname)
+
+- name: Collect this instance's (address, port) listener pairs
+  ansible.builtin.set_fact:
+    _carlos_listener_pairs:
+      - ["127.0.0.1", "{{ carlos_victorialogs_port | int }}"]
+      - ["127.0.0.1", "{{ carlos_victoriametrics_port | int }}"]
+      - ["127.0.0.1", "{{ carlos_pma_port | int }}"]
+      - ["127.0.0.1", "{{ carlos_vmalert_port | int }}"]
+      - ["{{ carlos_bind_ip }}", "{{ carlos_https_port | int }}"]
+      - ["{{ carlos_bind_ip }}", "{{ carlos_https_publish_port | int }}"]
+      - ["{{ carlos_bind_ip }}", "{{ carlos_http_publish_port | int }}"]
+      - ["{{ carlos_bind_ip }}", "{{ carlos_log_view_port | int }}"]
+
+- name: Cross-check every listener against siblings on the same machine (unified set)
+  vars:
+    _sib_pairs:
+      - ["127.0.0.1", "{{ hostvars[item]['carlos_victorialogs_port'] | default(_role_defaults.carlos_victorialogs_port) | int }}"]
+      - ["127.0.0.1", "{{ hostvars[item]['carlos_victoriametrics_port'] | default(_role_defaults.carlos_victoriametrics_port) | int }}"]
+      - ["127.0.0.1", "{{ hostvars[item]['carlos_pma_port'] | default(_role_defaults.carlos_pma_port) | int }}"]
+      - ["127.0.0.1", "{{ hostvars[item]['carlos_vmalert_port'] | default(_role_defaults.carlos_vmalert_port) | int }}"]
+      - ["{{ hostvars[item]['carlos_bind_ip'] | default(_role_defaults.carlos_bind_ip) }}",
+         "{{ hostvars[item]['carlos_https_port'] | default(_role_defaults.carlos_https_port) | int }}"]
+      - ["{{ hostvars[item]['carlos_bind_ip'] | default(_role_defaults.carlos_bind_ip) }}",
+         "{{ hostvars[item]['carlos_https_publish_port'] | default(_role_defaults.carlos_https_publish_port) | int }}"]
+      - ["{{ hostvars[item]['carlos_bind_ip'] | default(_role_defaults.carlos_bind_ip) }}",
+         "{{ hostvars[item]['carlos_http_publish_port'] | default(_role_defaults.carlos_http_publish_port) | int }}"]
+      - ["{{ hostvars[item]['carlos_bind_ip'] | default(_role_defaults.carlos_bind_ip) }}",
+         "{{ hostvars[item]['carlos_log_view_port'] | default(_role_defaults.carlos_log_view_port) | int }}"]
+    # A 0.0.0.0 bind (opted into via carlos_allow_any_bind) claims EVERY
+    # address, so it collides with any sibling listener on the same port.
+    _listener_clashes: >-
+      {%- set out = [] -%}
+      {%- for mine in _carlos_listener_pairs -%}
+        {%- for theirs in _sib_pairs -%}
+          {%- if mine[1] | int == theirs[1] | int
+                and (mine[0] == theirs[0]
+                     or mine[0] == '0.0.0.0' or theirs[0] == '0.0.0.0') -%}
+            {%- set _ = out.append(mine[0] ~ ':' ~ mine[1]) -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ out }}
+  ansible.builtin.assert:
+    that: _listener_clashes | length == 0
+    fail_msg: >-
+      listener clash with sibling instance
+      '{{ hostvars[item]['carlos_instance'] | default(_role_defaults.carlos_instance) }}'
+      on {{ _listener_clashes | join(', ') }} — every (address, port) a
+      sibling publishes must be free; offset the clashing port(s) or give
+      this instance its own carlos_bind_ip
+  loop: "{{ groups['all'] | difference([inventory_hostname]) }}"
+  when:
+    - hostvars[item]['ansible_host'] | default(item) == ansible_host | default(inventory_hostname)
+
+- name: At most one instance per machine owns the host firewall (default-deny front door)
+  # carlos_host_firewall_enabled installs a HOST-GLOBAL 'policy drop' input
+  # base chain. Two instances each registering one means a packet accepted by
+  # A's chain still hits end-of-chain drop in B's (and vice-versa) — mutual
+  # lockout, possibly including SSH. Refuse more than one owner per machine.
+  ansible.builtin.assert:
+    that:
+      # Sibling hostvars never contain ROLE DEFAULTS (the port checks above
+      # load _role_defaults for exactly this reason). With
+      # carlos_host_firewall_enabled defaulting TRUE, `default(false)` made
+      # this assert vacuous for the shipped configuration: two
+      # default-config instances each loaded their own host-global 'policy
+      # drop' table and mutually blackholed each other's front door
+      # (review finding).
+      # `| bool` on both sides: INI-inventory host-line vars arrive as the
+      # STRING "false", which is truthy in raw Jinja.
+      - not (carlos_host_firewall_enabled
+             | default(_role_defaults.carlos_host_firewall_enabled) | bool)
+        or not (hostvars[item]['carlos_host_firewall_enabled']
+                | default(_role_defaults.carlos_host_firewall_enabled) | bool)
+    fail_msg: >-
+      both '{{ carlos_instance }}' and sibling
+      '{{ hostvars[item]['carlos_instance'] | default(_role_defaults.carlos_instance) }}' set
+      carlos_host_firewall_enabled on
+      {{ ansible_host | default(inventory_hostname) }} — each installs a
+      host-global 'policy drop' input chain, so the two mutually deny each
+      other's (and possibly SSH's) traffic. Enable the host firewall on ONE
+      instance per machine only.
+  loop: "{{ groups['all'] | difference([inventory_hostname]) }}"
+  when:
+    - hostvars[item]['ansible_host'] | default(item) == ansible_host | default(inventory_hostname)

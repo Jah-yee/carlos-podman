@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Belt-and-braces: rendered instances normally live under $EMR_HOME
+# (default /usr/local/emr), OUTSIDE this repo — but guard against a stray
+# rendered secret ever being staged from the working tree.
+*.env
+!*.env.example
+secrets.enc.yaml
+age-key*
+*.bak
+*.new
+
+# `carlos-ctl setup` writes host_vars INTO the checkout, and until the
+# operator vaults it the file carries the plaintext MariaDB root password —
+# a `git add -A` must never stage it. Keep only explicit examples.
+ansible/host_vars/*.yml
+ansible/host_vars/*.yaml
+!ansible/host_vars/*.example.yml
+inventory
+!inventory.example
+
+# Python toolchain
+*.egg-info/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# sandbox-only build shim artifacts (never commit)
+.ccr-ca.crt
+.ccr-truststore.p12
+Containerfile.sandbox

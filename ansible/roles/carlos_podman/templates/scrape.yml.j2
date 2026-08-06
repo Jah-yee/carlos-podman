@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# vmagent scrape config for the carlos-app pod. vmagent runs in the app pod and
+# scrapes the mariadb + vmagent exporters over pod loopback, and node-exporter
+# (which now lives in the obs pod) cross-pod by pod name over carlos-net, then
+# remote-writes to the VictoriaMetrics store in the obs pod (the -remoteWrite.url
+# flag, set in the pod spec, buffers on the producer if the store is down).
+# Rendered per-instance by the carlos-podman Ansible role ({{ carlos_app_pod }}/{{ carlos_obs_pod }} = the pod names,
+# e.g. carlos-app/carlos-obs) so two groups on one host label their metrics
+# distinctly instead of both reporting "carlos-app"; add scrape jobs here as you
+# expose more metrics.
+global:
+  scrape_interval: 30s
+  external_labels:
+    instance: {{ carlos_app_pod }}
+
+scrape_configs:
+  # The exporter jobs (node/mariadb/vmagent self-metrics) deliberately stay
+  # credential-free: they are not the PHI stores, and adding auth there would
+  # require web-config machinery on each exporter for no boundary change.
+  - job_name: node
+    static_configs:
+      - targets: ['{{ carlos_obs_pod }}:9100']
+  - job_name: mariadb
+    static_configs:
+      - targets: ['127.0.0.1:9104']
+  - job_name: vmagent
+    static_configs:
+      - targets: ['127.0.0.1:8429']
+  # VictoriaLogs self-metrics, cross-pod: vmalert's LogIngestionStalled rule
+  # watches vl_rows_ingested_total — a running-but-non-shipping log pipeline
+  # must not die green (see vmalert-rules.yml.j2). This is the one job that
+  # crosses an AUTHED boundary; the password_file path rides the podman
+  # secret mount, so this 0644 file stays credential-free.
+  - job_name: victorialogs
+    static_configs:
+      - targets: ['{{ carlos_obs_pod }}:9428']
+{% if carlos_obs_http_auth | bool %}
+    basic_auth:
+{# to_json: the assert denylists only "/\ for the TOML/curl/Caddy holders — an
+   unquoted plain scalar here would let a `: `-bearing username corrupt the
+   YAML and crash-loop vmagent (all metric alerting down). JSON is a YAML
+   subset, so this is always safe.
+   COLUMN 0 IS LOAD-BEARING: this comment used to be indented 6 spaces. Jinja
+   deletes a comment's TEXT but KEEPS the whitespace that preceded it on that
+   line, and Ansible's trim_blocks then eats the newline after the closing
+   marker — so those 6 spaces were prepended to the next line, rendering
+   `username` at 12 spaces under a 6-space `password_file`. That is invalid
+   YAML, and vmagent hard-failed at startup ("cannot unmarshal data: yaml:
+   line 39: did not find expected key") and crash-looped on EVERY default
+   install (the obs profile and store auth are both on by default), taking
+   all metrics and every vmalert rule with it. Verified live; keep any
+   comment inside a mapping at column 0. #}
+      username: {{ carlos_obs_http_user | to_json }}
+      password_file: /etc/obs-auth/password
+{% endif %}

@@ -1,0 +1,10 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for runuser — records the invocation, then runs the wrapped command
+# in-process so it resolves back into the podman/systemctl stubs on PATH.
+# Form: runuser -u <user> -- <cmd...>
+echo "runuser $*" >> "${STUBLOG:-/dev/null}"
+shift 2          # drop "-u <user>"
+[[ "$1" == "--" ]] && shift
+exec "$@"

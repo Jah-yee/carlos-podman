@@ -1,0 +1,25 @@
+## SPDX-License-Identifier: GPL-3.0-or-later (derived from carlos-emr/carlos)
+## Copyright (C) 2026 CARLOS Contributors
+## ------------------------------------------------------------------------
+## drugref2.properties.j2 — rendered by the carlos-podman Ansible role into
+## $EMR_HOME/container/conf/drugref/drugref2.properties, then assembled by the
+## drugref-init initContainer into a tmpfs and read by the non-root (uid 10001)
+## drugref container via the baked /home/drugref/drugref2.properties symlink
+## into /run/drugref-config. The playbook fills in the db_password line at
+## render time with the MariaDB ROOT password — exactly as the bash did.
+## Source: carlos-emr/carlos develop
+##   .devcontainer/development/config/shared/volumes/drugref2.properties
+## Local changes vs upstream: db_url points at 127.0.0.1 (all containers
+## share the pod network namespace) and db_password is a placeholder.
+## ------------------------------------------------------------------------
+db_user=root
+db_url=jdbc:mysql://127.0.0.1:3306/drugref2?characterEncoding=UTF-8&connectionCollation=utf8mb4_general_ci
+db_driver=com.mysql.cj.jdbc.Driver
+{# Double backslashes for Java Properties — see carlos.properties.j2. #}
+db_password={{ carlos_db_root_password | replace('\\', '\\\\') }}
+#this is for Medispan if you have a license through OSCAR EMR
+#licence_key=
+#push the APO,NOVO,etc prefixes down below the non-prefixed names
+sort_down_mfg_tagged_generics=true
+#interaction_base_url=https://download.oscar-emr.com/ws/rs/accounts
+#scheduled_timer=300000

@@ -1,0 +1,358 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# carlos_podman role defaults — every knob the bash carlos-app.env exposed,
+# under the mechanical rename @TOKEN@ -> carlos_<token lowercased> (tokens
+# already starting with CARLOS_ just lowercase). Override per instance in
+# host_vars/<instance>.yml; `carlos-ctl setup` generates a starter file.
+---
+# --- identity -----------------------------------------------------------------
+carlos_instance: carlos
+carlos_emr_home: /usr/local/emr
+carlos_service_user: carlos
+# Home of the rootless engine owner, and therefore the parent of podman's
+# GRAPHROOT ($HOME/.local/share/containers/storage) — a runtime-correctness
+# setting, not cosmetics. podman's rootless network namespace masks /run
+# (always) and /var/lib (podman 4.x), which hides <graphroot>/networks from
+# netavark and makes every named bridge network resolve as "network not
+# found", i.e. no pod can start. See tasks/host.yml.
+#
+# /var/opt (FHS: variable data of add-on packages) rather than the otherwise
+# canonical /var/lib/<user>: it is outside both masked prefixes, always on
+# local disk, and — unlike /home/<user>, which most rootless-podman guides
+# use — never lands on an NFS/autofs mount (overlayfs does not work there;
+# podman silently falls back to the vfs driver, which multiplies disk usage)
+# or a noexec/quota'd filesystem.
+#
+# Override to put the ~4 GB image store on its own filesystem. Any path
+# outside /run works; `carlos-ctl play` re-checks the LIVE graphroot, so a
+# site-supplied storage.conf that moves it elsewhere is covered too.
+carlos_service_user_home: "/var/opt/{{ carlos_service_user }}"
+carlos_bind_ip: 127.0.0.1
+carlos_server_name: emr.example.ca
+
+# --- observability profile -----------------------------------------------------
+# true  = obs pod (VictoriaMetrics/Logs, vector, vmagent, exporters, vmalert,
+#         log view) is provisioned and the app pod carries vmagent+exporter.
+# false = journald-only logging; carlos-ctl monitor runs its own liveness
+#         sweep. Toggle EITHER WAY on a live instance: re-run the playbook,
+#         then `carlos-ctl db-users` (enable only) and `carlos-ctl play`.
+carlos_obs_enabled: true
+# HTTP basic auth on the obs stores (VictoriaLogs/VictoriaMetrics/vmalert):
+# without it, any local OS user or SSRF foothold could read the full log
+# retention window ({{ carlos_log_retention }} of PHI-adjacent content) with
+# zero credentials over host loopback. ONE regenerable credential per
+# instance; the plaintext lives ONLY in the root-only 0600
+# $EMR_HOME/secrets-private/obs-http-password (and, inline, in the 0600
+# vector config + Caddyfile) — never in the 0644 pod specs, never sealed.
+# false restores the legacy unauthenticated posture (accepted-risk row 1).
+carlos_obs_http_auth: true
+carlos_obs_http_user: obs
+# Empty = generate a random 32-char credential on the target, once. Set (and
+# vault) an explicit value to rotate it from host_vars; `carlos-ctl rotate
+# obs` rotates it host-side.
+carlos_obs_http_password: ""
+
+# --- front-door TLS mode ---------------------------------------------------------
+# selfsigned (default): the role/`play` auto-generate a self-signed pair —
+#   zero manual steps to a serving WAF; browsers warn until a real cert
+#   replaces the files under container/conf/waf/certs/.
+# manual: you place fullchain.pem/privkey.pem there yourself; play refuses
+#   without them (the historical behavior).
+# acme: certbot issues/renews via `carlos-ctl cert-renew` + a daily timer;
+#   requires carlos_acme_email, public DNS for carlos_server_name, and :80
+#   reachable (the role adds the port-80 nftables redirect in this mode).
+# Provider-login PIN storage. Empty = 'no' (cleartext), which is what
+# upstream's own Flyway seed writes for the bootstrap administrator — a 'yes'
+# default made that seeded account unable to log in AT ALL, because the login
+# path encrypts the SUBMITTED pin before comparing it to the stored cleartext
+# one (see the derivation comment in tasks/instance.yml). Note the
+# "encryption" is Misc.encryptPIN, a @Deprecated unsalted running-sum over the
+# characters — obfuscation, not protection — so 'no' gives up nothing real.
+# Set 'yes' only if every stored PIN is already in that format.
+carlos_pin_encrypted: ""
+
+carlos_tls_mode: selfsigned
+carlos_acme_email: ""
+# Where certbot's transient HTTP-01 listener publishes (rootless-bindable);
+# root's nftables redirects :80 here during a renewal. acme mode only.
+carlos_http_publish_port: 8081
+# Digest-pinned like every third-party image (resolved 2026-07).
+carlos_certbot_image: "docker.io/certbot/certbot:v4.2.0@sha256:9626d72120577cf72da4fc7948806e9993598981720a4cbe04340a502468d67b"
+
+# --- host-published ports -------------------------------------------------------
+# Loopback ports must be unique per instance on a shared host; the TLS ports
+# may instead be separated by a distinct carlos_bind_ip per instance.
+carlos_https_port: 443
+carlos_https_publish_port: 8443
+carlos_victorialogs_port: 9428
+carlos_victoriametrics_port: 8428
+carlos_log_view_port: 9443
+carlos_pma_port: 9444
+carlos_vmalert_port: 8880
+
+# --- images (third-party pinned by DIGEST — a re-pushed tag can never change
+# what a PHI system runs; resolve new digests with
+#   skopeo inspect --format '{{ "{{" }}.Digest{{ "}}" }}' docker://<repo>:<tag>) --
+carlos_image: localhost/carlos-app:latest
+carlos_drugref_image: localhost/carlos-drugref:latest
+carlos_db_image: "docker.io/library/mariadb:11.4.12@sha256:a794d9eb009e20de605858a11f32f63b4075cbd197c650436f0e3b457e4caed7"
+carlos_victorialogs_image: "docker.io/victoriametrics/victoria-logs:v1.51.0@sha256:e16dd33a95623cc21730cf5285344ed9f97419eeaff7d24b039c135beb85ee7e"
+# DEBIAN variant on purpose: Vector's journald source shells out to
+# journalctl, which the -alpine image does NOT ship (Vector #23016).
+carlos_vector_image: "docker.io/timberio/vector:0.56.0-debian@sha256:93b072b416fd29152f1bfe5bd2925a0b48999aeb069f3ae000691f82a135c200"
+carlos_caddy_image: "docker.io/library/caddy:2.11.4@sha256:af5fdcd76f2db5e4e974ee92f96ee8c0fc3edb55bd4ba5032547cbf3f65e486d"
+carlos_victoriametrics_image: "docker.io/victoriametrics/victoria-metrics:v1.136.0@sha256:593b533bfbea439f2fd8aed306294cb6a5b362e7932681ebb476cc6aaef70841"
+carlos_vmagent_image: "docker.io/victoriametrics/vmagent:v1.136.0@sha256:30efe54696dfb352fe89a1a8b0c977cfce5507f81b85741632bd810fa3e4fe86"
+# Same v1.136.0 OSS LTS line as VM/vmagent; -notifier.blackhole (required by
+# the monitor-relay alerting design) exists since v1.94 (VictoriaMetrics#4122).
+carlos_vmalert_image: "docker.io/victoriametrics/vmalert:v1.136.0@sha256:e756ea8839f295b4e789a739c3ac80d70404e11b918973506a6182aacca2b11e"
+carlos_node_exporter_image: "quay.io/prometheus/node-exporter:v1.11.1@sha256:0f422f62c15f154af8d8572b23d623aebfb10cec73a5c654d18f911f3f9df241"
+carlos_mysqld_exporter_image: "quay.io/prometheus/mysqld-exporter:v0.19.0@sha256:eacb4b18e2ec1e0abdf2d64851b68526c964f6d9cb3e9458fb5d5f5062ea94c1"
+# Pinned to a dated build of the CRS 4.25 LTS line, NGINX variant (ModSecurity v3).
+carlos_waf_image: "docker.io/owasp/modsecurity-crs:4.25.1-nginx-202607160307@sha256:a7d2e948d26ec310a127b261e4b9010ff2467b9f5f7eaed4921450bb7865ba08"
+carlos_restic_image: "docker.io/restic/restic:0.19.0@sha256:7f44e0057b82348597568ea209360762d0b38f8e1dbc8ad859661ac1055e45f2"
+carlos_phpmyadmin_image: "docker.io/library/phpmyadmin:5.2.3@sha256:aa4e217ae760c8f609840c28f612d86d017db5e37b5d4543764309f28fba2eb8"
+
+carlos_metrics_retention: 180d
+carlos_log_retention: 180d
+
+# --- container memory limits and JVM heap ---------------------------------------
+# A container's *_mem_limit must exceed its JVM *_java_xmx by a non-heap
+# margin (~2-4Gi for CARLOS) so a Java OutOfMemoryError — which writes the
+# heap dump — fires before the cgroup OOM-killer SIGKILLs the process.
+carlos_mem_limit: 12Gi
+carlos_java_xms: 4g
+carlos_java_xmx: 8g
+carlos_drugref_mem_limit: 2Gi
+carlos_drugref_java_xms: 256m
+carlos_drugref_java_xmx: 1g
+carlos_db_mem_limit: 6Gi
+carlos_victorialogs_mem_limit: 2Gi
+carlos_waf_mem_limit: 1Gi
+carlos_caddy_mem_limit: 256Mi
+carlos_victoriametrics_mem_limit: 2Gi
+carlos_vmagent_mem_limit: 512Mi
+carlos_vmalert_mem_limit: 256Mi
+carlos_node_exporter_mem_limit: 128Mi
+carlos_mysqld_exporter_mem_limit: 128Mi
+carlos_logcollect_mem_limit: 512Mi
+carlos_cpu_limit: 4
+carlos_drugref_cpu_limit: 2
+carlos_db_cpu_limit: 4
+carlos_victorialogs_cpu_limit: 2
+carlos_waf_cpu_limit: 2
+carlos_caddy_cpu_limit: 1
+carlos_victoriametrics_cpu_limit: 2
+carlos_vmagent_cpu_limit: 1
+carlos_vmalert_cpu_limit: 1
+carlos_node_exporter_cpu_limit: 1
+carlos_mysqld_exporter_cpu_limit: 1
+carlos_logcollect_cpu_limit: 1
+
+# --- runtime settings ------------------------------------------------------------
+carlos_tz: America/Toronto
+carlos_log_verbosity: INFO
+carlos_db_auto_upgrade: "1"
+carlos_waf_paranoia: 1
+# CRS defaults (5 inbound / 4 outbound): a single CRITICAL-severity
+# signature scores 5, so at the CRS default a lone SQLi/XSS/RCE hit blocks
+# even at paranoia 1. The previous 10/5 let a clean single-signature attack
+# through (logged, not blocked). Raise per-instance only if a specific
+# clinical workflow trips false positives.
+carlos_waf_anomaly_inbound: 5
+carlos_waf_anomaly_outbound: 4
+# Host default-deny firewall (input policy drop + explicit allows). ON by
+# default: a PHI host should not depend on every operator remembering to add an
+# external firewall. When true the role renders a drop-policy input chain
+# allowing loopback, established/related, ICMP, SSH (carlos_host_firewall_ssh_port),
+# the front-door HTTPS port, and the log-view port per its CIDR; everything else
+# inbound is dropped. Safety rails: the role ASSERTS carlos_host_firewall_ssh_port
+# is a valid port and present in the allow set before applying, so a bad value
+# fails the playbook instead of locking you out.
+#
+# IMPORTANT — it is HOST-GLOBAL, not per-instance: on a MULTI-INSTANCE host
+# enable it for exactly ONE instance (its allow set must cover every instance's
+# front door), or set carlos_host_firewall_enabled: false on the others. Set
+# false if an external/cloud firewall already fronts the host and you do not
+# want a second nftables table on the box.
+carlos_host_firewall_enabled: true
+# The SSH port the default-deny allow set must keep open. Override if sshd
+# listens elsewhere — a wrong value here would drop your own management plane.
+carlos_host_firewall_ssh_port: 22
+# nginx ssl_protocols syntax (the WAF is the nginx CRS variant).
+carlos_waf_ssl_protocols: "TLSv1.2 TLSv1.3"
+# Joined lazily at render time — the value is the same colon-separated
+# string nginx expects; the list form only keeps the line readable.
+carlos_waf_ssl_ciphers: >-
+  {{ ['ECDHE-ECDSA-AES128-GCM-SHA256',
+      'ECDHE-RSA-AES128-GCM-SHA256',
+      'ECDHE-ECDSA-AES256-GCM-SHA384',
+      'ECDHE-RSA-AES256-GCM-SHA384',
+      'ECDHE-ECDSA-CHACHA20-POLY1305',
+      'ECDHE-RSA-CHACHA20-POLY1305'] | join(':') }}
+# ABFHKZ = headers + matched rules, NO bodies (C/E/I/J carry PHI) — a
+# conscious HIPAA/PIPEDA decision, see README "WAF audit log & PHI".
+carlos_waf_audit_log_parts: ABFHKZ
+carlos_log_view_user: logview
+# Empty = generate one at provisioning (bcrypt hash on disk, plaintext shown
+# once). Prefer vaulting an explicit value.
+carlos_log_view_password: ""
+# Source CIDR allowed to reach the log view on carlos_bind_ip. Empty = derive
+# the subnet of the interface carrying bind_ip (FAIL-CLOSED if underivable);
+# 'rfc1918' = the broad private-ranges fallback (explicit opt-in).
+carlos_log_view_allow_cidr: ""
+# Upstream DNS for the pod containers when the host uses systemd-resolved
+# (its 127.0.0.53 stub is unreachable from inside the pod netns).
+carlos_pod_dns: ""
+# Explicit safety opt-outs (declared so a reader sees them and `--check` never
+# hits an undefined var). Each defaults to the SAFE posture:
+#   any_bind    — accept BIND_IP=0.0.0.0 (services bind all interfaces; the
+#                 nft 'ip daddr' gate becomes a no-op). Off by default.
+#   nft_failure — proceed when the nftables ruleset fails to apply (only where
+#                 another firewall layer owns these rules). Off by default.
+#   selinux     — proceed on an Enforcing SELinux host (mounts must be labeled
+#                 by hand — no :z/:Z relabel here). Off by default.
+carlos_allow_any_bind: false
+carlos_allow_nft_failure: false
+carlos_accept_selinux: false
+# Accept a podman/systemd older than the documented floors (podman >= 4.9,
+# systemd >= 248) — old runtimes fail AFTER deploy in version-shaped ways
+# (livenessProbes never wired, kube play rejecting specs); only set this if
+# you have verified your runtime handles them.
+carlos_allow_old_runtime: false
+# Extra host-firewall allow entries for the SINGLE hostfw owner on a
+# multi-instance machine: list of {ip, port} pairs, one per sibling listener
+# the host-global default-deny must admit (each sibling's bind_ip with its
+# https_port AND https_publish_port, plus its log-view port if used). The
+# firewall is host-global and single-owner (the asserts refuse dual
+# ownership), so WITHOUT these entries a disabled-hostfw sibling's front
+# door is silently dropped by the owner's policy.
+#   carlos_host_firewall_extra_allow:
+#     - {ip: 192.0.2.11, port: 443}
+#     - {ip: 192.0.2.11, port: 18443}
+carlos_host_firewall_extra_allow: []
+
+# --- backups ----------------------------------------------------------------------
+carlos_restic_repository: "{{ carlos_emr_home }}/backup/restic-repo"
+# Empty = generate at provisioning. ESCROW IT OFF-HOST — without it backups
+# are unreadable. Prefer vaulting an explicit value.
+carlos_restic_password: ""
+carlos_backup_oncalendar: "*-*-* 01:30:00"
+carlos_binlog_oncalendar: "*:0/15"
+carlos_docs_oncalendar: "*:0/15"
+carlos_backup_verify_oncalendar: "Sun *-*-* 04:30:00"
+# Every 15 minutes: the monitor is the ONLY relay from vmalert's rule state
+# to an off-box page (vmalert runs -notifier.blackhole), so this cadence IS
+# the metric-alert paging ceiling. The old hourly default meant a mysql_up
+# failure could wait ~1h to page.
+carlos_monitor_oncalendar: "*:0/15"
+
+# --- alerting ---------------------------------------------------------------------
+carlos_alert_webhook: ""
+carlos_alert_email: ""
+carlos_heartbeat_url: ""
+carlos_cert_expiry_warn_days: 21
+# Percent-free floor shared by the monitor's statvfs check and vmalert's
+# DiskLow rule (rendered into carlos-app.env as DISK_MIN_FREE so both
+# consumers stay on one threshold).
+carlos_disk_min_free: 10
+# Minutes of zero log ingestion before LogIngestionStalled fires (the vmalert
+# rule's `for:` window). Replaces the bash monitor's LOGS_MAX_AGE_MIN env
+# knob — set it here, not in carlos-app.env.
+carlos_logs_max_age_min: 30
+# Pre-OOM lead time: MemoryLowHost fires when the kernel's own reclaimable
+# estimate (MemAvailable) stays below this percent of MemTotal for 10m —
+# post-mortem heap-dump detection is the only other memory signal.
+carlos_mem_min_avail_pct: 8
+# LoadHigh fires when load15 exceeds this multiple of the core count for 30m
+# (sustained saturation, not a burst).
+carlos_load15_per_core_max: 2
+
+# Durable home for the operational env knobs carlos-ctl reads that have no
+# dedicated carlos_* variable — rendered verbatim into the (playbook-owned)
+# carlos-app.env, so they survive every playbook run. Hand-edits to
+# carlos-app.env do NOT survive; this dict is the supported path. Example:
+#   carlos_extra_env:
+#     ALERT_REMIND_HOURS: 12
+#     BACKUP_MAX_AGE_HOURS: 30
+#     CARLOS_ACCEPT_LOCAL_REPO: 1
+carlos_extra_env: {}
+
+# --- build refs -------------------------------------------------------------------
+carlos_ref: develop
+carlos_drugref_ref: master
+
+# --- credentials ------------------------------------------------------------------
+# REQUIRED for provisioning (renders carlos.properties and the db secret).
+# Vault it: ansible-vault encrypt_string --name carlos_db_root_password
+carlos_db_root_password: ""
+# REQUIRED — AES-256 key (base64) the app uses to encrypt stored credentials
+# (e.g. fax provider passwords). Current carlos develop refuses first boot
+# without one pre-provisioned, because the app would otherwise generate a key
+# and persist it into carlos.properties — which this deployment mounts
+# read-only. Generate once per instance and vault it like the db password:
+#   openssl rand -base64 32
+# Rotating it orphans values already encrypted under the old key — treat it
+# as a data key and escrow it with the other instance secrets.
+carlos_encryption_secret_key: ""
+# Generated when empty (Sharing-Center keystores; inert until enabled).
+carlos_tomcat_keystore_password: ""
+carlos_tomcat_truststore_password: ""
+
+# --- carlos.properties site values --------------------------------------------------
+# ON and BC are the provinces CARLOS implements billing for.
+carlos_billing_province: "ON"
+# --- clinical/data-behavior knobs (opt-in; defaults preserve upstream) -------------
+# Allergy checking at prescribe time. 'no' is the inherited OSCAR default —
+# the EMR does NOT check new prescriptions against recorded allergies.
+# Sites SHOULD evaluate 'yes'; kept opt-in because flipping clinical-workflow
+# behavior on an upgrade is its own risk (README: "Clinical-safety toggles").
+carlos_rx_allergy_checking: "no"
+
+# Browser (headless Chromium) eForm->PDF renderer. 'off' skips the app's
+# boot-time browser-launch probe — the shipped image carries no Chromium, so
+# the probe can only fail (one ERROR burst per container start). A site that
+# extends the image with a browser sets 'warn' and pins both paths (blank =
+# let Selenium resolve, which cannot work on the read-only root):
+carlos_eform_pdf_browser_startup_check: "off"
+carlos_eform_pdf_browser_chromium_path: ""
+carlos_eform_pdf_browser_chromedriver_path: ""
+
+# Build tag surfaced by the app (FHIR sender name, Rourke export metadata);
+# the app defaults to "UNKNOWN" when unset. Static on purpose — a per-run
+# timestamp here would break the playbook's idempotency contract.
+carlos_buildtag: "carlos-podman"
+
+# HL7 ADT A04 file generation on new-patient registration. OFF by default:
+# the upstream-inherited 'true' pointed at /var/lib/adt/, which exists in no
+# image and is mounted by no pod spec (readOnlyRootFilesystem), so every
+# registration logged "Unable to generate HL7 A04 file" while the toggle read
+# enabled — a dead-green integration. A site that consumes A04s must set this
+# true AND mount a writable volume at carlos_hl7_a04_dir in a spec override.
+carlos_hl7_a04_generation: false
+carlos_hl7_a04_dir: /var/lib/adt/
+# JDBC zeroDateTimeBehavior. 'round' (upstream default) turns a stored
+# 0000-00-00 into a REAL date on read — a fabricated clinical date;
+# 'convertToNull' surfaces it as null instead. Validate app behavior first.
+carlos_jdbc_zero_date: "round"
+
+# --- system paths (overridable ONLY for the hermetic test suite) --------------------
+carlos_credstore_dir: /etc/credstore.encrypted
+carlos_systemd_dir: /etc/systemd/system
+carlos_journal_dir: /var/log/journal
+# Persistent-journal size ceiling, installed as a journald.conf.d drop-in
+# (SystemMaxUse). The journal carries the app/db/waf streams (PHI-adjacent)
+# and is the ONLY log copy when the obs pod is disabled — this bound is both
+# disk-safety and a retention decision. Empty string = leave the host's own
+# journald policy untouched (no drop-in installed).
+carlos_journald_max_use: 4G
+carlos_instance_registry_dir: /etc/carlos-podman/instances
+carlos_quadlet_root: /etc/containers/systemd/users
+carlos_tmpfiles_dir: /etc/tmpfiles.d
+# Where the carlos_ctl Python package + shim install.
+carlos_ctl_lib_dir: /usr/local/lib/carlos-ctl
+carlos_ctl_bin: /usr/local/sbin/carlos-ctl
+
+# THE datadir signature (must stay in lockstep with carlos_ctl/guard.py —
+# an initialized MariaDB datadir ALWAYS holds mysql/ under mariadb-mnt).
+carlos_datadir_signature: mariadb-mnt/mysql

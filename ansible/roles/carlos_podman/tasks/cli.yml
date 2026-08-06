@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Install the carlos-ctl Python CLI WITHOUT pip/PyPI: runtime deps come from
+# distro packages and the package directory is copied from this checkout —
+# a PHI host needs no network access at deploy time.
+---
+- name: Runtime Python dependencies (distro packages — no pip at deploy time)
+  ansible.builtin.package:
+    name:
+      - python3
+      - "{{ 'python3-yaml' if ansible_facts['os_family'] | default('Debian') != 'RedHat'
+            else 'python3-pyyaml' }}"
+      - python3-bcrypt
+    state: present
+  # The apt backend needs python3-apt to even QUERY state in --check and
+  # aborts the whole play without it (a fresh Debian host has no python3-apt
+  # until a real run auto-installs it) — the documented drift review must
+  # complete anyway. Real runs still fail loudly on install problems.
+  ignore_errors: "{{ ansible_check_mode }}"
+
+# Copy the .py sources individually (the package is a single flat directory)
+# instead of the whole directory: a recursive copy would ship the control
+# node's __pycache__/ too, and the old copy-everything-then-delete-pycache
+# pair re-uploaded and re-deleted it on EVERY run — the play never converged
+# to changed=0 and `--check --diff` (the documented drift review) was
+# permanently dirty with phantom .pyc diffs on any control node that had run
+# pytest or the CLI from the checkout.
+- name: Install the carlos_ctl package directory
+  ansible.builtin.file:
+    path: "{{ carlos_ctl_lib_dir }}/carlos_ctl"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+
+- name: Install the carlos_ctl package
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ carlos_ctl_lib_dir }}/carlos_ctl/{{ item | basename }}"
+    mode: "0644"
+    owner: root
+    group: root
+  with_fileglob:
+    - "{{ playbook_dir }}/../carlos_ctl/*.py"
+
+- name: Drop compiled caches from the installed tree (bash-era / pre-fileglob upgrades)
+  ansible.builtin.file:
+    path: "{{ carlos_ctl_lib_dir }}/carlos_ctl/__pycache__"
+    state: absent
+
+- name: Install the carlos-ctl shim
+  ansible.builtin.copy:
+    dest: "{{ carlos_ctl_bin }}"
+    mode: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/usr/bin/env python3
+      # SPDX-License-Identifier: AGPL-3.0-only
+      # carlos-ctl launcher — installed by the carlos_podman Ansible role.
+      import sys
+
+      sys.path.insert(0, "{{ carlos_ctl_lib_dir }}")
+      from carlos_ctl.cli import main
+
+      sys.exit(main())

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Provision CARLOS EMR instances. Each inventory host is ONE INSTANCE (a
+# machine running two instances appears twice with the same ansible_host and
+# different host_vars) — the role's assert tasks cross-check siblings.
+#
+#   sudo ansible-playbook -i inventory site.yml
+#   sudo ansible-playbook -i inventory site.yml --check --diff   # drift review
+#
+# Control-node requirements: ansible-core, passlib (bcrypt hashing for the
+# log-view credential), netaddr (ansible.utils IP filters):
+#   pip install ansible-core passlib netaddr && ansible-galaxy collection install ansible.utils
+---
+- name: Provision CARLOS EMR instances
+  hosts: all
+  become: true
+  # Run pending handlers even if a later task fails: several handlers do the
+  # daemon-reload that makes a just-rendered unit/timer loadable. Without this,
+  # a failure after a render but before the end-of-play handler flush would
+  # leave changed unit files on disk that systemd has not re-read — a confusing
+  # half-applied state on the next run.
+  force_handlers: true
+  roles:
+    - carlos_podman

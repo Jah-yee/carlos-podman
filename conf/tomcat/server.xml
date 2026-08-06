@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-License-Identifier: GPL-3.0-or-later (based on carlos-emr/carlos devcontainer config)
+  Copyright (C) 2026 CARLOS Contributors
+
+  Tomcat 11 server.xml for the carlos-app pod. Based on the config shipped in
+  carlos-emr/carlos .devcontainer/development/config/tomcat/conf/server.xml.
+  Installed by carlos-ctl to $EMR_HOME/container/conf/tomcat/server.xml and
+  mounted read-only over /usr/local/tomcat/conf/server.xml.
+
+  Do not reuse the old OpenO-era server.xml here — it targeted an older
+  Tomcat major version.
+
+  The shutdown port is disabled (port="-1"). The pod lifecycle is managed by
+  podman/systemd (`carlos-ctl down` -> `podman kube down`), so the Tomcat
+  shutdown listener serves no purpose here; leaving it bound to 8005 with the
+  default "SHUTDOWN" command would let any co-container in the shared pod
+  network namespace stop the EMR by connecting to 127.0.0.1:8005.
+-->
+<Server port="-1" shutdown="SHUTDOWN">
+  <Listener className="org.apache.catalina.startup.VersionLoggerListener"/>
+  <Listener className="org.apache.catalina.core.AprLifecycleListener"/>
+  <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener"/>
+  <Listener className="org.apache.catalina.mbeans.GlobalResourcesLifecycleListener"/>
+  <Listener className="org.apache.catalina.core.ThreadLocalLeakPreventionListener"/>
+
+  <GlobalNamingResources>
+    <Resource name="UserDatabase"
+              auth="Container"
+              type="org.apache.catalina.UserDatabase"
+              description="User database that can be updated and saved"
+              factory="org.apache.catalina.users.MemoryUserDatabaseFactory"
+              pathname="conf/tomcat-users.xml"/>
+  </GlobalNamingResources>
+
+  <Service name="Catalina">
+    <!-- PLAINTEXT connector, LOOPBACK ONLY (address pins it to 127.0.0.1):
+         serves the in-pod consumers that never leave the network namespace —
+         the liveness/startup probes and the CARLOS->DrugRef calls. It is NOT
+         reachable from the WAF or anything else on the edge network; the
+         cross-pod hop uses the TLS connector below. maxPostSize/
+         maxSwallowSize sized for document and lab uploads (50 MB), matching
+         upstream. server= replaces the default Apache-Coyote/1.1 banner —
+         clients only ever see nginx's own header. -->
+    <Connector port="8080" protocol="HTTP/1.1"
+               address="127.0.0.1"
+               connectionTimeout="20000"
+               maxPostSize="52428800"
+               maxSwallowSize="52428800"
+               server="CARLOS"
+               redirectPort="8443"/>
+
+    <!-- TLS connector for the WAF hop: the WAF lives in its OWN pod and
+         proxies here across the carlos-edge podman network — a real veth
+         hop on the host, not pod-internal loopback — so PHI in transit is
+         encrypted on that segment (nginx: BACKEND=https://...:8443 with
+         PROXY_SSL=on in the waf pod spec).
+         The keystore is a SELF-SIGNED cert generated fresh into the
+         tomcat-tls tmpfs emptyDir by the tls-init initContainer on every pod
+         start (RAM-only, dies with the pod). The keystore password below is
+         deliberately STATIC AND NON-SECRET: PKCS12 integrity/privacy adds
+         nothing here because the keystore FILE itself is the boundary —
+         uid-10001-owned in a pod-private tmpfs; anyone who can read it is
+         already inside the pod. Keep it in sync with tls-init's -passout in
+         carlos-app.yaml.j2.
+         RESIDUAL (documented): the WAF does not VERIFY this cert
+         (proxy_ssl_verify off — the image's template has no
+         trusted-certificate hook, and the cert is regenerated per start);
+         upstream AUTHENTICATION still rests on the edge network's membership
+         boundary, as before. This hop upgrade is about passive-capture
+         resistance, not upstream authn. -->
+    <Connector port="8443" protocol="org.apache.coyote.http11.Http11NioProtocol"
+               SSLEnabled="true" scheme="https" secure="true"
+               connectionTimeout="20000"
+               maxPostSize="52428800"
+               maxSwallowSize="52428800"
+               server="CARLOS">
+      <SSLHostConfig protocols="TLSv1.2+TLSv1.3">
+        <Certificate certificateKeystoreFile="/run/tomcat-tls/keystore.p12"
+                     certificateKeystorePassword="carlos-in-pod-tls"
+                     certificateKeystoreType="PKCS12"/>
+      </SSLHostConfig>
+    </Connector>
+
+    <Engine name="Catalina" defaultHost="localhost">
+      <Realm className="org.apache.catalina.realm.LockOutRealm">
+        <Realm className="org.apache.catalina.realm.UserDatabaseRealm"
+               resourceName="UserDatabase"/>
+      </Realm>
+      <Host name="localhost" appBase="webapps" unpackWARs="true" autoDeploy="false">
+        <!-- Trust X-Forwarded-* from the WAF so the app generates https://
+             redirects and secure cookies behind the proxy. The WAF lives in
+             its OWN pod and reaches this connector over the carlos-edge
+             podman network, so its source address is a pod-subnet IP (netavark
+             assigns from the 10.x default pool), not 127.0.0.1.
+             internalProxies is PINNED to 10.0.0.0/8 rather than left at
+             Tomcat's default: the default also trusts 192.168.0.0/16 and
+             172.16.0.0/12, the ranges real LAN clients sit on. RemoteIpValve
+             walks X-Forwarded-For right-to-left and treats any address in
+             internalProxies as a proxy to skip — so under the default a client
+             on a 192.168/172.16 LAN could inject a spoofed X-Forwarded-For and
+             have it recorded as the PHI-access source IP (its own real IP would
+             be skipped as "internal"). Narrowing to 10/8 (where only the pod
+             network lives) drops that vector. Residual: a client whose real
+             address is itself in 10/8 could still spoof; a host with custom
+             netavark default_subnet_pools OUTSIDE 10/8 must widen this regex to
+             match its edge-network subnet (or the valve stops trusting the WAF
+             — see the LOGIN DEPENDENCY below).
+             Safe because neither connector is published on a host interface
+             (:8080 is loopback-pinned; :8443 is pod-network-only) — the only
+             peers that can connect are pod-network members (waf, obs-pod
+             containers, on-demand admin tools).
+             LOGIN DEPENDENCY: if this valve stops matching the WAF's source
+             address, Tomcat no longer sees X-Forwarded-Proto, drops the
+             https:// scheme and Secure-cookie handling, and login breaks —
+             verify a live login after any change here. -->
+        <Valve className="org.apache.catalina.valves.RemoteIpValve"
+               remoteIpHeader="X-Forwarded-For"
+               protocolHeader="X-Forwarded-Proto"
+               internalProxies="10\.\d{1,3}\.\d{1,3}\.\d{1,3}"/>
+        <!-- Access log to stdout (directory+prefix+suffix resolve to
+             /dev/stdout): the container writes to stdout, which podman's
+             journald log driver sends to the host journal, where the obs pod's
+             logcollect (Vector) tails it into the log store — so no log files
+             exist. %{ms}T appends per-request processing time in milliseconds.
+             PHI: the pattern logs "%m %U %H" (method, path, protocol) and
+             deliberately NOT %r/%q — the query string can carry PHI-correlating
+             identifiers (demographicNo=, HIN in search params) and must not be
+             aggregated into the shipped log store.
+             requestAttributesEnabled: use the client address the RemoteIpValve
+             above resolved from X-Forwarded-For — the valve restores the raw
+             peer address before the access log writes at request completion,
+             so without this flag %h logs the WAF pod's IP for every request
+             and real client IPs exist only in the waf-access stream. -->
+        <Valve className="org.apache.catalina.valves.AccessLogValve"
+               directory="/dev" prefix="stdout" suffix=""
+               rotatable="false" buffered="false"
+               requestAttributesEnabled="true"
+               pattern="%h %l %u %t &quot;%m %U %H&quot; %s %b %{ms}T"/>
+        <!-- Do not leak the Tomcat version or a stack trace / JSP source in
+             error responses to clients (this is a PHI app behind the WAF):
+             showServerInfo=false hides the version, showReport=false returns
+             only the HTTP status with no report body. -->
+        <Valve className="org.apache.catalina.valves.ErrorReportValve"
+               showServerInfo="false" showReport="false"/>
+      </Host>
+    </Engine>
+  </Service>
+</Server>

@@ -1,0 +1,211 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# MariaDB configuration for the carlos-app pod.
+# Adapted from the carlos-emr/carlos devcontainer my.cnf (written for MariaDB
+# 10.5) for the newer official mariadb images used by carlos-app.yaml.
+# Installed by carlos-ctl to $EMR_HOME/container/conf/mariadb/ and mounted at
+# /etc/mysql/conf.d/zz-carlos.cnf.
+
+[client]
+default-character-set = utf8mb4
+
+[mysqld]
+# innodb_page_size is fixed when the datadir is first initialized and MUST
+# match the existing datadir (the OpenO/CARLOS db images use 32K). Never
+# change this once you have data.
+innodb_page_size = 32K
+
+# SERVER charset is utf8mb4-READY: any table created without an explicit
+# charset, and any connection that does not override it, gets full 4-byte
+# Unicode (emoji, CJK-extension and other astral-plane code points that appear
+# in real patient names and clinical free-text). utf8mb4_general_ci is the
+# 4-byte equivalent of the OSCAR-lineage app's historical utf8_general_ci, so
+# the server default matches the app's collation family. init-connect MUST be
+# utf8mb4 too — otherwise every non-super connection would be re-pinned to
+# utf8mb3 and defeat the server default (init-connect is skipped for SUPER
+# users, i.e. root; the app connects as the non-super carlos/drugref accounts,
+# so it applies to them).
+#
+# SCHEMA STATUS (updated for the Flyway pipeline): the legacy script build
+#   (createdatabase_generic.sh, oscarinit*.sql) that created utf8mb3/MyISAM
+#   tables is RETIRED in the app repo. The live Flyway baseline
+#   (database/mysql/migration/common/V1__baseline_schema.sql + province
+#   files) creates tables ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 — the schema
+#   now matches this cnf's server defaults, so full Unicode (emoji/CJK) in
+#   patient text works end-to-end. InnoDB is configured for utf8mb4 long
+#   indexes (innodb_default_row_format = dynamic → 3072-byte prefix limit;
+#   innodb_file_per_table = 1). One known stray: the ON/BC schema files create
+#   formRourke2009 as ENGINE=Aria — `carlos-ctl backup` flags any non-InnoDB
+#   table it finds (PITR consistency), so drift here is caught at backup time.
+#   See README DB.
+#
+#   `sql_mode = ""` (below) disables STRICT: out-of-range/too-long/invalid
+#   values are COERCED instead of rejected, and zero dates are allowed. The
+#   OSCAR-lineage app relies on this; turning STRICT on is a SEPARATE,
+#   app-affecting decision and is intentionally left off here.
+character-set-server = utf8mb4
+collation-server = utf8mb4_general_ci
+init-connect = 'SET NAMES utf8mb4'
+sql_mode = ""
+
+# OFF to save several hundred MB of instrumentation memory. NOTE: this makes
+# the mysqld-exporter's `GRANT SELECT ON performance_schema.*` (provisioned by
+# db-users for sites that turn P_S on) inert — its perf-schema collectors
+# return nothing while OFF. Flip to ON only with a matching DB_MEM_LIMIT bump.
+performance_schema = OFF
+skip-external-locking
+
+# File-I/O hardening. secure_file_priv confines LOAD_FILE()/INTO OUTFILE/LOAD
+# DATA to one dedicated directory: without it, ANY account holding FILE (root
+# above all — the seed state before db-users provisions least-privilege
+# accounts) can read/write arbitrary paths the server can reach, a direct
+# PHI-exfiltration and file-planting primitive through SQL alone.
+# local-infile=0 closes the client-side companion (LOAD DATA LOCAL), which a
+# compromised app account could otherwise use to make the CLIENT read files.
+secure_file_priv = /var/lib/mysql-files
+local-infile = 0
+# Disallow symlinked tables — a symlink under the datadir could otherwise
+# redirect table files outside secure_file_priv. (MariaDB defaults this off,
+# but pin it explicitly.)
+symbolic-links = 0
+
+# In-pod loopback ONLY. The WAF runs in its own pod on a shared "edge"
+# network with this pod; without this bind, <app-pod>:3306 would be reachable
+# from the internet-facing WAF (and any other pod-network peer). In-pod
+# clients (carlos, drugref, mysqld-exporter) connect via 127.0.0.1; host-side
+# admin (phpMyAdmin, a host mariadb client) uses the unix socket exposed at
+# $EMR_HOME/run/db-socket/mysqld.sock, or `podman exec`. `carlos-ctl check`
+# asserts 3306 is NOT reachable from the WAF pod — if you remove this line,
+# that check fails.
+bind_address = 127.0.0.1
+# Debian-image default, pinned here because the host-visible socket mount and
+# phpMyAdmin's PMA_SOCKET path both depend on it.
+socket = /run/mysqld/mysqld.sock
+
+# No log_error: errors go to stderr (the image default), which the pod's
+# journald log driver sends to the host journal; the obs pod's logcollect
+# (Vector) ships it to VictoriaLogs — no log file to manage.
+
+# --- memory budget (keep in sync with DB_MEM_LIMIT, default 6Gi) -------------
+# The cgroup OOM-killer SIGKILLs mariadbd at DB_MEM_LIMIT (crash recovery on
+# next start), so worst-case server allocation must stay below it:
+#   fixed:   innodb_buffer_pool_size 2048M + innodb_log_buffer_size 64M
+#          + key_buffer_size 128M + server/dictionary/thread-cache overhead
+#          ~250M                                              ~= 2.5G
+#   per connection (x max_connections = 100):
+#          sort_buffer 4M + read_buffer 2M + read_rnd_buffer 1M
+#          + join_buffer (default 256K) + thread stack ~300K  ~= 8M typical
+#          (+ up to tmp_table_size 32M per in-memory temp table on GROUP BY /
+#           DISTINCT-heavy queries; past 32M the table spills to disk)
+#          -> 100 conns ~0.8G typical; multi-GiB only if EVERY connection
+#             materializes a 32M temp table at once (implausible)
+#   episodic: bulk_insert_buffer_size 16M per bulk-inserting session;
+#          myisam_sort_buffer_size 128M per MyISAM/Aria repair or index build
+#          (was 512M — shrunk: the schema is InnoDB, repairs are rare)
+# Realistic peak ~2.5G fixed + ~1G connections + one 128M repair ~= 3.6G,
+# leaving >2G headroom inside DB_MEM_LIMIT=6Gi even with temp-table spikes.
+# If you must run DB_MEM_LIMIT=4Gi, shrink innodb_buffer_pool_size to 1G
+# FIRST — the pool is the only safe large knob to trade away.
+max_connections = 100
+connect_timeout = 5
+wait_timeout = 600
+# 1G to match the [mysqldump] ceiling below: --hex-blob dumps DOUBLE every
+# BLOB's bytes, so any raw blob the server accepts at write time must also
+# fit at RELOAD time after doubling. At the old 256M a 128-256M raw blob
+# (large scanned PDF, imaging attachment) was writable but produced an INSERT
+# the server rejected on reload — the backup existed, the restore didn't.
+# The reload clients' --max-allowed-packet=1G CANNOT exceed this server cap,
+# so the server value is the one that decides restorability.
+max_allowed_packet = 1G
+thread_cache_size = 128
+sort_buffer_size = 4M
+bulk_insert_buffer_size = 16M
+tmp_table_size = 32M
+max_heap_table_size = 32M
+
+myisam_recover_options = BACKUP
+key_buffer_size = 128M
+table_open_cache = 400
+myisam_sort_buffer_size = 128M
+concurrent_insert = 2
+read_buffer_size = 2M
+read_rnd_buffer_size = 1M
+
+default_storage_engine = InnoDB
+innodb_buffer_pool_size = 2G
+innodb_log_file_size = 2G
+innodb_log_buffer_size = 64M
+innodb_file_per_table = 1
+innodb_open_files = 400
+innodb_flush_method = O_DIRECT
+# Pinned OFF to match the OSCAR-lineage schema (row-format/key-length
+# warnings stay warnings, not errors) — same permissive-mode rationale as
+# sql_mode="" above; see the README DB section before changing.
+innodb_strict_mode = 0
+
+# OPT-IN hardening (finding S17): the ready-to-enable STRICT block below
+# rejects silent truncation/coercion (over-length clinical free-text
+# truncated mid-note, out-of-range lab values coerced, zero dates invented)
+# instead of storing corrupted data. It is OFF because the OSCAR-lineage
+# schema/app can rely on the permissive behavior — enable ONLY after
+# validating your workload on a staging copy (README: "MariaDB strictness
+# and data integrity"). Uncomment BOTH lines together and restart the db.
+# This block sits BELOW the permissive sql_mode/innodb_strict_mode lines on
+# purpose: MariaDB option files are LAST-occurrence-wins, so uncommenting
+# here overrides both (placed earlier, innodb_strict_mode = 0 above would
+# silently win and the hardening would half-apply — review finding).
+#sql_mode = STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+#innodb_strict_mode = 1
+innodb_default_row_format = dynamic
+innodb_flush_neighbors = 0
+innodb_io_capacity = 2000
+innodb_random_read_ahead = OFF
+innodb_flush_log_at_trx_commit = 1
+# Unlike the dev my.cnf, the doublewrite buffer stays ON here (crash safety)
+# and the deprecated query_cache_* settings are omitted.
+
+# Binary log for point-in-time recovery: closed binlogs are shipped to
+# restic every 15 minutes (carlos-binlog.timer), and the nightly dump
+# records its binlog coordinates (--master-data=2) as the replay anchor.
+# Dedicated directory so the backup container mounts only binlogs, never
+# the datadir (an init container chowns it to the image's mysql user).
+# sync_binlog=1 pairs with innodb_flush_log_at_trx_commit=1 above for
+# full durability of every committed transaction.
+server_id = 1
+log_bin = /var/lib/mysql-binlog/binlog
+binlog_format = ROW
+sync_binlog = 1
+# 10 days of local binlog retention. binlog_expire_logs_seconds supersedes the
+# deprecated expire_logs_days (which emits a startup warning on MariaDB 10.6+,
+# now visible in the shipped `db` stream). Must stay >= how long a shipped
+# binlog might sit before the next backup run reaches it.
+binlog_expire_logs_seconds = 864000
+max_binlog_size = 100M
+
+# Slow query log off by default — it is file-only in MariaDB. Point it
+# under the persisted datadir if you enable it (not shipped to the store).
+#slow_query_log = 1
+#slow_query_log_file = /var/lib/mysql/mariadb-slow.log
+#long_query_time = 10
+
+# OPT-IN database audit trail (finding C24): admin/DBA access via the host
+# unix socket, `podman exec ... mariadb`, or the on-demand phpMyAdmin
+# bypasses the app's user-activity audit AND the WAF access log — MariaDB
+# itself records nothing. HIPAA-style audit expectations cover privileged
+# access to ePHI, so sites needing a DB-level trail should enable the
+# server_audit plugin below (file lands under the persisted datadir; size
+# the rotation before enabling — CONNECT+QUERY_DDL is a moderate volume,
+# full QUERY logging on a busy EMR is heavy and can capture PHI in
+# statements, so ship/retain the audit file accordingly). See the README
+# "Database audit trail" section.
+#plugin_load_add = server_audit
+#server_audit_logging = ON
+#server_audit_events = CONNECT,QUERY_DDL,QUERY_DCL
+#server_audit_file_path = /var/lib/mysql/server_audit.log
+#server_audit_file_rotate_size = 100000000
+#server_audit_file_rotations = 9
+
+[mysqldump]
+quick
+quote-names
+max_allowed_packet = 1G

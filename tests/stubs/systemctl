@@ -1,0 +1,30 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for systemctl — records invocations, succeeds at everything.
+echo "systemctl $*" >> "${STUBLOG:-/dev/null}"
+# Version floor probes (asserts.yml + carlos-ctl check): systemd >= 248.
+if [[ "$1" == "--version" ]]; then echo "systemd 255 (255.4-1)"; exit 0; fi
+# Strip the rootless user-manager flags so the verb dispatch below is the same
+# for system and `--user -M <user>@` calls.
+while [[ "$1" == "--user" || "$1" == "-M" ]]; do
+    [[ "$1" == "-M" ]] && shift 2 || shift
+done
+case "$1" in
+  is-active)
+      # STUB_INACTIVE_UNITS (space-separated) forces specific units to report
+      # 'failed'; everything else is 'active'.
+      for u in ${STUB_INACTIVE_UNITS:-}; do
+          if [[ " $* " == *" $u "* ]]; then echo failed; exit 3; fi
+      done
+      echo active;;
+  list-timers) echo "[stub timers]";;
+  is-failed)
+      # `is-failed` returns 0 only when the unit IS failed. Default: not failed
+      # (exit 1). STUB_FAILED_UNITS (space-separated) forces specific units failed.
+      for u in ${STUB_FAILED_UNITS:-}; do
+          if [[ " $* " == *" $u "* ]]; then echo failed; exit 0; fi
+      done
+      echo active; exit 1;;
+esac
+exit 0

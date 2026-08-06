@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Installed by the carlos-podman Ansible role to /etc/systemd/system/
+# (acme TLS mode only). Runs certbot as a one-shot rootless container;
+# a CHANGED cert is installed into conf/waf/certs and the waf + obs pods
+# restart to serve it. `--keep-until-expiring` makes the daily cadence a
+# cheap no-op most days.
+[Unit]
+Description=CARLOS EMR TLS renewal (certbot, acme mode)
+OnFailure={{ carlos_instance }}-alert@%n.service
+
+[Service]
+Type=oneshot
+# Type=oneshot defaults TimeoutStartSec to INFINITY: a hung certbot (dead
+# ACME endpoint, wedged pull) must not sit forever — OnFailure only covers
+# runs that EXIT.
+TimeoutStartSec=15min
+Environment=EMR_HOME={{ carlos_emr_home }}
+ExecStart=/usr/local/sbin/carlos-ctl cert-renew
+Nice=10
+
+# Same runuser + rootless-podman-safe hardening set as the monitor unit
+# (NoNewPrivileges/ProtectHome would break the setuid transition and the
+# rootless engine's storage under the service user's HOME).
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictRealtime=yes
+LockPersonality=yes

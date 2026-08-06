@@ -1,0 +1,376 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+#
+# DEVELOPMENT/TEST pod spec for `podman kube play` — the minimal CARLOS
+# app+db pod behind the verified QUICKSTART.md walk-through. This is NOT the
+# production pod: the Ansible role renders carlos-app.yaml.j2 with the WAF,
+# DrugRef, observability, secrets sealing, guard flags, and resource limits.
+# Differences from the production spec, on purpose:
+#   - drugref / mysqld-exporter / vmagent containers omitted (drug lookups
+#     and the obs pipeline are not part of the dev loop)
+#   - resource limits omitted (rootless limits need cgroup v2 + systemd
+#     delegation; on hosts without them the limits are silently ignored)
+#   - guard-flags dir empty (fresh install), app-secrets dir empty (password
+#     rendered directly into the base properties, as before `carlos-ctl seal`)
+#   - the 8443 TLS connector gets a hostPort so a browser can reach the app
+#     without the WAF pod (production publishes NO ports on this pod)
+#   - the db passes --tmpdir=/db-tmp instead of mounting the emptyDir at
+#     /tmp: podman 4.9 kube play's readOnlyRootFilesystem auto-tmpfs can
+#     shadow an emptyDir mounted exactly at /tmp with a root-owned 0755
+#     tmpfs, which kills InnoDB temp-file creation for uid 999; for the
+#     same reason the carlos container mounts its temp emptyDir at
+#     /carlos-tmp and points TMPDIR/-Djava.io.tmpdir there
+#   - db-init's vmagent chown dropped with the vmagent container
+#
+# Usage (see QUICKSTART.md for the full verified walk-through):
+#   sed -e "s|__EMR_HOME__|$HOME/emr|g" \
+#       -e "s|__DB_ROOT_HASH_B64__|<base64 of the mysql_native_password hash>|" \
+#       examples/carlos-app-dev.yaml > ~/emr/carlos-app-dev.yaml
+#   podman kube play ~/emr/carlos-app-dev.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: carlos-db-secret
+type: Opaque
+data:
+  mariadb-root-password-hash: __DB_ROOT_HASH_B64__
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: carlos-app
+  labels:
+    app: carlos-app
+  annotations:
+    io.podman.annotations.pids-limit/db: "2048"
+    io.podman.annotations.pids-limit/carlos: "2048"
+spec:
+  restartPolicy: OnFailure
+  initContainers:
+    - name: db-init
+      image: "docker.io/library/mariadb:11.4.12@sha256:a794d9eb009e20de605858a11f32f63b4075cbd197c650436f0e3b457e4caed7"
+      command: ["bash", "-c", "set -e; if [ -f /guard/deployed ] && [ ! -f /guard/accept-empty-datadir ] && [ ! -d /var/lib/mysql/mysql ]; then echo 'FATAL: deployed instance but /var/lib/mysql holds no initialized MariaDB datadir' >&2; exit 1; fi; chown 999:999 /var/lib/mysql-binlog /run/mysqld /backup/mariadb-hot /db-tmp /var/lib/mysql-files; [ \"$(stat -c %u /var/lib/mysql)\" = 999 ] || chown -R 999:999 /var/lib/mysql"]
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+          add: ["CHOWN", "DAC_OVERRIDE"]
+      volumeMounts:
+        - name: mariadb-data
+          mountPath: /var/lib/mysql
+        - name: mariadb-binlog
+          mountPath: /var/lib/mysql-binlog
+        - name: db-socket
+          mountPath: /run/mysqld
+        - name: db-hot-backup
+          mountPath: /backup/mariadb-hot
+        - name: db-tmp
+          mountPath: /db-tmp
+        - name: db-secure-files
+          mountPath: /var/lib/mysql-files
+        - name: guard-flags
+          mountPath: /guard
+          readOnly: true
+
+    - name: carlos-init
+      image: "localhost/carlos-app:latest"
+      command: ["bash", "-c", "set -e; umask 077; { cat /config-base/carlos.properties; cat /run/app-secrets/carlos-db.properties 2>/dev/null || true; } >/run/carlos-config/carlos.properties; chown 10001:10001 /run/carlos-config/carlos.properties; if [ \"$(grep '^db_password=' /run/carlos-config/carlos.properties | tail -1)\" = 'db_password=__SEALED__' ]; then echo 'FATAL: db_password is __SEALED__ with no unsealed fragment' >&2; exit 1; fi; for d in /usr/local/tomcat/logs /var/lib/OscarDocument; do [ $(stat -c %u $d) = 10001 ] || chown -R 10001:10001 $d; done; chown 10001:10001 /tomcat-work /tomcat-temp /tomcat-tmp"]
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+          add: ["CHOWN", "DAC_OVERRIDE"]
+      volumeMounts:
+        - name: carlos-conf
+          mountPath: /config-base/carlos.properties
+          subPath: carlos.properties
+          readOnly: true
+        - name: app-secrets
+          mountPath: /run/app-secrets
+          readOnly: true
+        - name: carlos-config
+          mountPath: /run/carlos-config
+        - name: carlos-logs
+          mountPath: /usr/local/tomcat/logs
+        - name: carlos-documents
+          mountPath: /var/lib/OscarDocument
+        - name: carlos-work
+          mountPath: /tomcat-work
+        - name: carlos-temp
+          mountPath: /tomcat-temp
+        - name: carlos-tmp
+          mountPath: /tomcat-tmp
+
+    - name: tls-init
+      image: "localhost/carlos-app:latest"
+      command: ["bash", "-c", "set -e; umask 077; openssl req -x509 -newkey rsa:2048 -days 3650 -nodes -subj '/CN=carlos-app' -addext 'subjectAltName=DNS:carlos-app,DNS:carlos-app-carlos' -keyout /run/tomcat-tls/key.pem -out /run/tomcat-tls/cert.pem 2>/dev/null; openssl pkcs12 -export -in /run/tomcat-tls/cert.pem -inkey /run/tomcat-tls/key.pem -name tomcat -passout pass:carlos-in-pod-tls -out /run/tomcat-tls/keystore.p12; rm -f /run/tomcat-tls/key.pem /run/tomcat-tls/cert.pem; chmod 0400 /run/tomcat-tls/keystore.p12; chown 10001:10001 /run/tomcat-tls/keystore.p12"]
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+          add: ["CHOWN", "DAC_OVERRIDE"]
+      volumeMounts:
+        - name: tomcat-tls
+          mountPath: /run/tomcat-tls
+
+  containers:
+    - name: db
+      image: "docker.io/library/mariadb:11.4.12@sha256:a794d9eb009e20de605858a11f32f63b4075cbd197c650436f0e3b457e4caed7"
+      # --tmpdir on the emptyDir instead of /tmp: podman 4.9 kube play's
+      # readOnlyRootFilesystem auto-tmpfs can shadow an emptyDir mounted
+      # exactly at /tmp with a root-owned 0755 tmpfs (nondeterministic),
+      # which kills InnoDB temp-file creation for uid 999.
+      args: ["--tmpdir=/db-tmp"]
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        runAsNonRoot: true
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      livenessProbe:
+        exec:
+          command:
+            - bash
+            - -c
+            - >-
+              healthcheck.sh --connect 2>/dev/null
+              || mariadb-admin ping --silent 2>/dev/null
+              || exec 3<>/dev/tcp/127.0.0.1/3306
+        initialDelaySeconds: 90
+        periodSeconds: 30
+        timeoutSeconds: 10
+        failureThreshold: 5
+      startupProbe:
+        exec:
+          command:
+            - bash
+            - -c
+            - >-
+              healthcheck.sh --connect 2>/dev/null
+              || mariadb-admin ping --silent 2>/dev/null
+              || exec 3<>/dev/tcp/127.0.0.1/3306
+        periodSeconds: 15
+        timeoutSeconds: 10
+        failureThreshold: 80
+      env:
+        - name: TZ
+          value: "UTC"
+        # Only consulted when the datadir is EMPTY (first boot); an existing
+        # datadir keeps the credentials it already has — re-rendering this
+        # YAML with a new hash and replaying does NOT rotate the root
+        # password (use SET PASSWORD via podman exec; see QUICKSTART).
+        - name: MARIADB_ROOT_PASSWORD_HASH_FILE
+          value: /run/db-init-secret/mariadb-root-password-hash
+        - name: MARIADB_AUTO_UPGRADE
+          value: "1"
+      volumeMounts:
+        - name: db-init-secret
+          mountPath: /run/db-init-secret
+          readOnly: true
+        - name: mariadb-data
+          mountPath: /var/lib/mysql
+        - name: mariadb-binlog
+          mountPath: /var/lib/mysql-binlog
+        - name: mariadb-conf
+          mountPath: /etc/mysql/conf.d/zz-carlos.cnf
+          subPath: zz-carlos.cnf
+          readOnly: true
+        - name: db-socket
+          mountPath: /run/mysqld
+        - name: db-hot-backup
+          mountPath: /backup/mariadb-hot
+        - name: db-tmp
+          mountPath: /db-tmp
+        - name: db-secure-files
+          mountPath: /var/lib/mysql-files
+
+    - name: carlos
+      image: "localhost/carlos-app:latest"
+      # Wait for the `oscar` DATABASE to be queryable (not just TCP 3306) so a
+      # fresh install whose schema is loaded after `kube play` does not hard-
+      # fail Tomcat's context on 'Unknown database'. Creds are read from the
+      # assembled carlos.properties (last-wins) and the password rides MYSQL_PWD
+      # (off-argv). The sed halves doubled backslashes — the renderers write
+      # the java-properties-ESCAPED value (\ -> \\), and reading it raw made
+      # the loop auth-fail for backslash-bearing passwords, stalling EVERY pod
+      # start the full 600s (verified live 2026-08-01). 600s budget, then
+      # start anyway (a dead DB is the liveness probe's job).
+      command: ["/usr/bin/tini", "--", "bash", "-c", "P=/run/carlos-config/carlos.properties; u=$(grep -m1 '^db_username=' \"$P\" | cut -d= -f2-); export MYSQL_PWD=\"$(grep '^db_password=' \"$P\" | tail -1 | cut -d= -f2- | sed 's/\\\\\\\\/\\\\/g')\"; ok=0; for i in $(seq 1 120); do mariadb -u\"${u:-root}\" -h 127.0.0.1 oscar -e 'SELECT 1' >/dev/null 2>&1 && { ok=1; break; }; sleep 5; done; unset MYSQL_PWD; [ \"$ok\" = 1 ] || echo 'WARN: oscar DB not queryable after 600s — starting Tomcat anyway (load the schema, then it recovers)' >&2; exec catalina.sh run"]
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      # Verification-only: expose the TLS connector on the host. Production
+      # publishes NO ports here (the WAF pod fronts 8443 over the edge net).
+      # LOOPBACK-ONLY publish: a dev instance runs with well-known seeded
+      # credentials — never expose it beyond the workstation. Change hostIP
+      # only on an isolated network, deliberately. Loopback is NOT a
+      # per-user boundary: every local uid on the host can reach 127.0.0.1,
+      # so run this on a single-user workstation only (see QUICKSTART).
+      # NOTE: this publish also voids server.xml's RemoteIpValve assumption
+      # ("neither connector is published on a host interface") — under
+      # rootless port forwarding the in-pod source address is the forwarder's
+      # (127.0.0.1 or a 10/8 gateway, port-handler-dependent). Worse than
+      # merely unattributable: when that source lands in 10/8 it MATCHES the
+      # valve's internalProxies pin, so a client-supplied X-Forwarded-For is
+      # TRUSTED and the access/audit logs record attacker-chosen client IPs
+      # (forged evidence, not just missing evidence). Production restores
+      # attribution by fronting with the WAF pod and publishing nothing here.
+      ports:
+        - containerPort: 8443
+          hostPort: 8443
+          hostIP: "127.0.0.1"
+      livenessProbe:
+        exec:
+          command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080; printf 'GET /carlos/ HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' >&3; head -n1 <&3 | grep -qE '^HTTP/1\\.[01] [23]'"]
+        initialDelaySeconds: 180
+        periodSeconds: 30
+        timeoutSeconds: 10
+        failureThreshold: 5
+      startupProbe:
+        exec:
+          command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080; printf 'GET /carlos/ HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' >&3; head -n1 <&3 | grep -qE '^HTTP/1\\.[01] [23]'"]
+        periodSeconds: 10
+        failureThreshold: 120
+        timeoutSeconds: 10
+      env:
+        - name: LANG
+          value: en_US.UTF-8
+        - name: LANGUAGE
+          value: en_US:en
+        - name: TZ
+          value: "UTC"
+        - name: CATALINA_OPTS
+          value: "-Xms512m -Xmx3g -XX:MaxGCPauseMillis=200 -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/usr/local/tomcat/logs/carlos-oom.hprof -XX:ErrorFile=/usr/local/tomcat/logs/hs_err_%p.log -Xlog:gc*:stdout:time,uptime,level,tags -Djava.security.egd=file:/dev/./urandom -Djava.awt.headless=true -Dfile.encoding=UTF-8 -Djava.net.preferIPv4Stack=true --add-opens java.base/java.net=ALL-UNNAMED -Dcarlos_override_properties=/run/carlos-config/carlos.properties -Djava.io.tmpdir=/carlos-tmp"
+        # Native helpers and libc tempfile() honor TMPDIR; the temp emptyDir
+        # is deliberately not at /tmp (auto-tmpfs shadow — header note).
+        - name: TMPDIR
+          value: "/carlos-tmp"
+      volumeMounts:
+        - name: carlos-config
+          mountPath: /run/carlos-config
+          readOnly: true
+        - name: tomcat-conf
+          mountPath: /usr/local/tomcat/conf/server.xml
+          subPath: server.xml
+          readOnly: true
+        - name: tomcat-conf
+          mountPath: /usr/local/tomcat/conf/context.xml
+          subPath: context.xml
+          readOnly: true
+        - name: tomcat-conf
+          mountPath: /usr/local/tomcat/conf/logging.properties
+          subPath: logging.properties
+          readOnly: true
+        - name: carlos-logs
+          mountPath: /usr/local/tomcat/logs
+        - name: carlos-documents
+          mountPath: /var/lib/OscarDocument
+        - name: carlos-work
+          mountPath: /usr/local/tomcat/work
+        - name: carlos-temp
+          mountPath: /usr/local/tomcat/temp
+        # NOT /tmp — the same auto-tmpfs shadow hazard the db's --tmpdir
+        # works around (header note); TMPDIR/-Djava.io.tmpdir point here.
+        - name: carlos-tmp
+          mountPath: /carlos-tmp
+        - name: tomcat-tls
+          mountPath: /run/tomcat-tls
+          readOnly: true
+
+  volumes:
+    - name: tomcat-conf
+      hostPath:
+        path: __EMR_HOME__/container/conf/tomcat
+        type: Directory
+    - name: carlos-conf
+      hostPath:
+        path: __EMR_HOME__/container/conf/carlos
+        type: Directory
+    - name: mariadb-conf
+      hostPath:
+        path: __EMR_HOME__/container/conf/mariadb
+        type: Directory
+    # NOTE: production renders the sealed fragments into /run/<instance>-emr
+    # (carlos_run_secrets_dir / Settings.run_secrets_dir); this dev spec keeps
+    # them under $EMR_HOME so `dev-setup.sh` can create the dir without root.
+    # The two must agree or `carlos-ctl seal` leaves the base properties at
+    # db_password=__SEALED__ while `secrets render` writes the real fragment
+    # somewhere this pod never mounts — the carlos-init guard then hard-fails
+    # the deploy. If you seal a QUICKSTART instance, export
+    # CARLOS_RUN_SECRETS_DIR=$EMR_HOME/run/app-secrets for every carlos-ctl
+    # invocation (seal, secrets render, rotate), or don't seal the dev path.
+    - name: app-secrets
+      hostPath:
+        path: __EMR_HOME__/run/app-secrets
+        type: DirectoryOrCreate
+    - name: carlos-config
+      emptyDir:
+        medium: Memory
+    - name: tomcat-tls
+      emptyDir:
+        medium: Memory
+    - name: carlos-work
+      emptyDir: {}
+    - name: carlos-temp
+      emptyDir: {}
+    - name: carlos-tmp
+      emptyDir: {}
+    - name: db-tmp
+      emptyDir: {}
+    - name: db-secure-files
+      emptyDir: {}
+    - name: db-init-secret
+      secret:
+        secretName: carlos-db-secret
+        defaultMode: 0444
+    - name: carlos-logs
+      hostPath:
+        path: __EMR_HOME__/logs/carlos
+        type: DirectoryOrCreate
+    - name: mariadb-data
+      hostPath:
+        path: __EMR_HOME__/data/mariadb-mnt
+        type: Directory
+    - name: mariadb-binlog
+      hostPath:
+        path: __EMR_HOME__/data/mariadb-binlog
+        type: Directory
+    - name: guard-flags
+      hostPath:
+        path: __EMR_HOME__/container/guard
+        type: Directory
+    - name: db-socket
+      hostPath:
+        path: __EMR_HOME__/run/db-socket
+        type: DirectoryOrCreate
+    - name: db-hot-backup
+      hostPath:
+        path: __EMR_HOME__/backup/mariadb-hot
+        type: DirectoryOrCreate
+    - name: carlos-documents
+      hostPath:
+        path: __EMR_HOME__/data/OscarDocument
+        type: Directory

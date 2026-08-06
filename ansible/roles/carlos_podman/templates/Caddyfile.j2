@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Caddyfile for the authenticated HTTPS observability view ("slim SIEM") — the
+# obs pod's logview container. Rendered by the carlos-podman Ansible role into
+# $EMR_HOME/container/conf/caddy/Caddyfile.
+#
+# The password is stored ONLY as a bcrypt hash (the basic_auth line below); the
+# plaintext is shown once at render time and kept nowhere on disk. Rotate it
+# with `carlos-ctl rotate log-view`. TLS is terminated with the same
+# certificate the WAF uses.
+#
+# ONE shared credential, NO lockout: Caddy basic_auth has no built-in rate
+# limit, and the view exposes up to LOG_RETENTION of PHI-adjacent logs — the
+# compensating controls are the nftables source-CIDR filter on this port
+# (fail-closed at provision time) and host fail2ban on the auth-failure log
+# lines (README, "Alerting & health monitoring"). Per-operator credentials:
+# add more `<user> <bcrypt-hash>` lines to basic_auth below (hash with
+# `podman run --rm caddy caddy hash-password`) — the role only manages the
+# first line.
+#
+# READ-ONLY by construction: only VictoriaLogs' read path (/select/*) and
+# VictoriaMetrics' UI + query APIs (/vmui, /api/v1/query*, labels/series/status)
+# are proxied; everything else (both stores' ingestion + admin endpoints,
+# including VM's /api/v1/write) returns 404. The app pod's vmagent writes to VM
+# over the shared network by pod name (carlos-obs:8428), not through this gate.
+{
+	auto_https off
+	admin off
+}
+
+https://:9443 {
+	tls /etc/ssl/private/fullchain.pem /etc/ssl/private/privkey.pem
+	# Access log to stdout (JSON) -> journald -> the host journal. Caddy
+	# emits NO request log (including 401s) without this directive, so the
+	# documented fail2ban brute-force defense for the single shared log-view
+	# credential had nothing to match. Required for that control to work.
+	log {
+		output stdout
+		format json
+	}
+	# Security headers on the PHI-facing HTTPS view: pin HTTPS in the browser
+	# (HSTS), forbid framing/MIME-sniffing, and strip the server banner.
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+	basic_auth {
+		{{ carlos_log_view_user }} {{ carlos_log_view_hash }}
+	}
+	# VictoriaLogs (logs): vmui UI + LogsQL query API.
+	handle /select/* {
+		reverse_proxy 127.0.0.1:9428 {
+{% if carlos_obs_http_auth | bool %}
+			# The stores require basic auth (carlos_obs_http_auth); this view
+			# authenticates the CLIENT above, then presents the store
+			# credential upstream. Refreshed by `carlos-ctl rotate obs`.
+			header_up Authorization "Basic {{ (carlos_obs_http_user ~ ':' ~ carlos_obs_http_password_effective) | b64encode }}"
+{% endif %}
+		}
+	}
+	# VictoriaMetrics (metrics): vmui UI + read-only query/metadata endpoints.
+	@vmread path /vmui /vmui/* /api/v1/query /api/v1/query_range /api/v1/labels /api/v1/label/* /api/v1/series /api/v1/status/* /metrics
+	handle @vmread {
+		reverse_proxy 127.0.0.1:8428 {
+{% if carlos_obs_http_auth | bool %}
+			header_up Authorization "Basic {{ (carlos_obs_http_user ~ ':' ~ carlos_obs_http_password_effective) | b64encode }}"
+{% endif %}
+		}
+	}
+	handle {
+		respond 404
+	}
+}

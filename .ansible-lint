@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# ansible-lint configuration for the carlos_podman role.
+#
+# ansible-lint is run as an ADVISORY linter here (see tests/ansible-checks.sh
+# and the CI workflow comment) — it floats unpinned, so a new release adding
+# style rules must not hard-fail CI. This file trims the systemic, DELIBERATE
+# project conventions from its output so the remaining findings are real signal
+# rather than hundreds of convention violations.
+skip_list:
+  # The role's variables use the established `carlos_` prefix, NOT
+  # `carlos_podman_`. This is a documented, load-bearing convention: every
+  # host_vars example, the README, defaults/main.yml, and the CLI's own
+  # `carlos_*` env contract all depend on it. Renaming ~190 variables to
+  # satisfy the role-prefix rule would break that contract for zero benefit.
+  - var-naming[no-role-prefix]
+  # Assert/handler tasks are deliberately named after the identifier or thing
+  # they check ("carlos_emr_home is an absolute path", "systemd daemon-reload")
+  # for grep-ability and readability — leading-lowercase by design.
+  - name[casing]
+  # Rootless management uses `systemctl --user -M <service_user>@ ...`,
+  # `podman secret`, and `nft` via command/shell because the builtin
+  # ansible.builtin.systemd module cannot target another user's --user manager
+  # over -M, and there is no core module for podman secrets / nftables here.
+  - command-instead-of-module

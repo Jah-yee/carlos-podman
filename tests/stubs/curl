@@ -1,0 +1,81 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for curl — the monitor and `check` probe the loopback-published
+# VictoriaMetrics/VictoriaLogs endpoints with curl; real curl would fail every
+# probe in the hermetic env (nothing listens), so this stub answers the store
+# endpoints deterministically and refuses everything else (front-door HTTPS,
+# webhooks) so those paths keep exercising their failure branches.
+#   STUB_VM_DOWN=1     VictoriaMetrics (:8428) /health becomes unreachable
+#   STUB_VL_DOWN=1     VictoriaLogs (:9428) /health becomes unreachable
+#   STUB_LOGS_STALE=1  VictoriaLogs /health OK but the recency query is EMPTY
+#                      (running-but-not-shipping pipeline)
+#   STUB_MYSQL_DOWN=1  the mysql_up scalar reads 0 (db-down corroboration)
+#   STUB_WEBHOOK_OK=1  webhook POSTs (any non-store URL with -X POST) succeed
+#   STUB_FRONT_DOOR=<code>  the front-door HTTPS probe (-w %{http_code})
+#                      answers <code>; unset = connection refused (exit 7),
+#                      the fail-closed default
+#   STUB_STORE_AUTH=1  the stores ENFORCE basic auth: a store URL whose -K
+#                      config carries no `user =` line is rejected (exit 22)
+#                      — drives check's auth-enforcement probe both ways
+echo "curl $*" >> "${STUBLOG:-/dev/null}"
+
+# When the caller passes the URL off-argv via `-K -` (config on stdin), real
+# curl reads stdin; drain it here so the upstream `printf | curl` producer does
+# not take SIGPIPE (which pipefail would surface as a delivery failure). Record
+# the config so tests can still see the URL that was sent.
+url=""
+cfg=""
+for a in "$@"; do
+    case "$a" in
+        http://*|https://*) url="$a";;
+        -K) cfg="$(cat 2>/dev/null || true)"; echo "curl-config $cfg" >> "${STUBLOG:-/dev/null}"
+            url="$(printf '%s' "$cfg" | sed -n 's/.*url *= *"\([^"]*\)".*/\1/p' | head -n1)";;
+    esac
+done
+
+# Store-auth enforcement mode: like the real -httpAuth.* stores, reject any
+# store request whose config carries no credential.
+if [[ -n "${STUB_STORE_AUTH:-}" ]]; then
+    case "$url" in
+        *:8428/*|*:9428/*|*:8880/*)
+            if [[ "$cfg" != *'user = "'* ]]; then exit 22; fi;;
+    esac
+fi
+
+case "$url" in
+    *:8428/health*) [[ -n "${STUB_VM_DOWN:-}" ]] && exit 7; exit 0;;
+    *:9428/health*) [[ -n "${STUB_VL_DOWN:-}" ]] && exit 7; exit 0;;
+    */api/v1/query*)
+        [[ -n "${STUB_VM_DOWN:-}" ]] && exit 7
+        # Scalar responses: down-count queries read 0, everything else 1 —
+        # enough for both the monitor (mysql_up, count(up == 0)) and check
+        # (count(up), count(up{job=...} == 1), mysql_up).
+        q=""
+        prev=""
+        for a in "$@"; do
+            [[ "$prev" == "--data-urlencode" ]] && q="$a"
+            prev="$a"
+        done
+        if [[ "$q" == *mysql_up* && -n "${STUB_MYSQL_DOWN:-}" ]]; then
+            echo '{"status":"success","data":{"result":[{"value":[0,"0"]}]}}'
+        elif [[ "$q" == *"== 0"* ]]; then
+            echo '{"status":"success","data":{"result":[{"value":[0,"0"]}]}}'
+        else
+            echo '{"status":"success","data":{"result":[{"value":[0,"1"]}]}}'
+        fi
+        exit 0;;
+    */select/logsql/query*)
+        [[ -n "${STUB_VL_DOWN:-}" ]] && exit 7
+        [[ -n "${STUB_LOGS_STALE:-}" ]] && exit 0   # /health OK, but no recent lines
+        echo '{"_msg":"stub log line"}'
+        exit 0;;
+esac
+# Front-door end-to-end probe (monitor + check): an argv https:// URL with the
+# status-code write-out. Prints the stubbed code like curl -w %{http_code}.
+if [[ "$url" == https://* && " $* " == *" %{http_code} "* ]]; then
+    if [[ -n "${STUB_FRONT_DOOR:-}" ]]; then printf '%s' "$STUB_FRONT_DOOR"; exit 0; fi
+    printf '000'; exit 7
+fi
+if [[ " $* " == *" -X POST "* && -n "${STUB_WEBHOOK_OK:-}" ]]; then exit 0; fi
+exit 7

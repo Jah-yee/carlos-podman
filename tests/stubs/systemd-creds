@@ -1,0 +1,27 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for systemd-creds — fake "encryption" that wraps the plaintext
+# in ENC[...] so tests can assert on sealed content. Supports the exact
+# invocations carlos-ctl and carlos-backup.sh use: has-tpm2, and
+# encrypt/decrypt with --name=, file-or-'-' source and destination.
+echo "systemd-creds $*" >> "${STUBLOG:-/dev/null}"
+case "$1" in
+  has-tpm2) [[ -n "${STUB_NO_TPM:-}" ]] && exit 1; exit 0;;
+  encrypt)
+      shift; while [[ "$1" == --* ]]; do shift; done
+      src="$1"; dst="$2"
+      # Byte-faithful wrap (no $() trailing-newline stripping) so the seal
+      # round-trip verify in seal_one gets an exact copy back.
+      { printf 'ENC['; if [[ "$src" == "-" ]]; then cat; else cat "$src"; fi; printf ']'; } > "$dst";;
+  decrypt)
+      shift; while [[ "$1" == --* ]]; do shift; done
+      src="$1"; dst="${2:--}"
+      # STUB_CREDS_DECRYPT_FAIL=<substring>: fail decrypts whose source path
+      # matches (models a TPM change corrupting ONE legacy blob without
+      # breaking the age-key decrypt every other path needs).
+      if [[ -n "${STUB_CREDS_DECRYPT_FAIL:-}" && "$src" == *"$STUB_CREDS_DECRYPT_FAIL"* ]]; then exit 1; fi
+      # Strip the leading `ENC[` (4 bytes) and trailing `]` (1 byte) byte-exactly.
+      if [[ "$dst" == "-" ]]; then tail -c +5 "$src" | head -c -1; else tail -c +5 "$src" | head -c -1 > "$dst"; fi;;
+esac
+exit 0

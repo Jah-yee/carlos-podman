@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-License-Identifier: GPL-3.0-or-later (based on carlos-emr/carlos devcontainer config)
+  Copyright (C) 2026 CARLOS Contributors
+
+  Tomcat 11 server.xml for the drugref container in the carlos-app pod.
+  All pod containers share one network namespace, so this Tomcat must stay
+  off the ports the CARLOS Tomcat uses: the HTTP connector moves to 8180
+  (drugref_url in carlos.properties points at 127.0.0.1:8180) and the
+  shutdown port is disabled (port="-1"), as it is on the CARLOS Tomcat — the
+  pod lifecycle is managed by podman/systemd, so no Tomcat shutdown listener
+  is needed.
+
+  Installed by carlos-ctl to $EMR_HOME/container/conf/drugref/server.xml and
+  mounted read-only over /usr/local/tomcat/conf/server.xml. The same file is
+  baked into the image by Containerfile.drugref as its default.
+-->
+<Server port="-1" shutdown="SHUTDOWN">
+  <Listener className="org.apache.catalina.startup.VersionLoggerListener"/>
+  <Listener className="org.apache.catalina.core.AprLifecycleListener"/>
+  <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener"/>
+  <Listener className="org.apache.catalina.core.ThreadLocalLeakPreventionListener"/>
+
+  <Service name="Catalina">
+    <!-- Not published by the pod; only reachable over pod-internal loopback.
+         A loopback-only RemoteCIDRValve additionally restricts clients to
+         127.0.0.1 — via the external descriptor the image bakes at
+         conf/Catalina/localhost/drugref2.xml (the WAR's own context.xml
+         valve default is un-parseable; see drugref2-context.xml). -->
+    <!-- address="127.0.0.1": pin the connector to the pod's loopback so
+         DrugRef is reachable only from the CARLOS container sharing this pod's
+         network namespace, never from other pods on the edge network. This
+         matches the CARLOS connector and the MariaDB bind_address and makes
+         the RemoteCIDRValve genuine defense-in-depth rather than the SOLE
+         control (the in-WAR valve default is un-parseable per
+         drugref2-context.xml, so a failed external-descriptor mount would
+         otherwise leave DrugRef exposed on the pod network). -->
+    <Connector port="8180" protocol="HTTP/1.1"
+               address="127.0.0.1"
+               connectionTimeout="20000"
+               redirectPort="8443"/>
+
+    <Engine name="Catalina" defaultHost="localhost">
+      <Host name="localhost" appBase="webapps" unpackWARs="true" autoDeploy="false">
+        <!-- Access log to stdout -> host journal (journald driver) ->
+             logcollect (Vector) -> log store, same as the carlos Tomcat.
+             Logs "%m %U %H" (no query string) — see the carlos server.xml for
+             the PHI rationale. -->
+        <Valve className="org.apache.catalina.valves.AccessLogValve"
+               directory="/dev" prefix="stdout" suffix=""
+               rotatable="false" buffered="false"
+               pattern="%h %l %u %t &quot;%m %U %H&quot; %s %b %{ms}T"/>
+        <!-- Do not leak the Tomcat version or a stack trace in error
+             responses (mirrors the CARLOS Tomcat). -->
+        <Valve className="org.apache.catalina.valves.ErrorReportValve"
+               showServerInfo="false" showReport="false"/>
+      </Host>
+    </Engine>
+  </Service>
+</Server>

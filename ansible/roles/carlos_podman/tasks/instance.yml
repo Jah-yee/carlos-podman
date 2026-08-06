@@ -1,0 +1,1465 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# INSTANCE provisioning (the bash cmd_bootstrap + sync-conf). Ownership split:
+#   PLAYBOOK-OWNED (re-rendered every run — drift handling IS re-running):
+#     carlos-app.env, pod YAMLs, systemd units, quadlets, nft ruleset,
+#     vector/vmagent/vmalert configs, the registry entry, the build context.
+#   OPERATOR-OWNED (rendered once, force: false — never overwritten):
+#     carlos.properties, drugref2.properties, Caddyfile, restic.env,
+#     exporter.my.cnf, zz-carlos.cnf and the verbatim confs, resolv.conf.
+---
+# --- log-view source filter derivation (fail-closed on a PHI surface) -----------
+# Resolution order (same as the bash derive_log_view_allow): loopback BIND_IP
+# -> no filter needed; explicit carlos_log_view_allow_cidr -> verbatim
+# ('rfc1918' expands to the broad private set); else the CIDR of the
+# interface carrying BIND_IP, from gathered facts.
+- name: Find the interface carrying BIND_IP (primary OR secondary address)
+  ansible.builtin.set_fact:
+    carlos_log_view_filter_enabled: >-
+      {{ not (carlos_bind_ip.startswith('127.') or carlos_bind_ip == 'localhost') }}
+    # Consider BOTH the primary ipv4 dict AND ipv4_secondaries: a BIND_IP set to
+    # a secondary/VIP address on an interface is invisible if only ipv4.address
+    # is matched, which would leave the log-view subnet underivable and (with a
+    # non-loopback BIND_IP) fail the fail-closed assert below on a perfectly
+    # valid config.
+    _bind_ipv4: >-
+      {{ ((ansible_facts['interfaces'] | default([])
+           | map('extract', ansible_facts)
+           | selectattr('ipv4', 'defined') | map(attribute='ipv4') | list)
+          + (ansible_facts['interfaces'] | default([])
+             | map('extract', ansible_facts)
+             | selectattr('ipv4_secondaries', 'defined')
+             | map(attribute='ipv4_secondaries') | flatten | list))
+         | selectattr('address', 'eq', carlos_bind_ip)
+         | first | default({}) }}
+
+- name: Derive the log-view allow set
+  ansible.builtin.set_fact:
+    carlos_log_view_allow: >-
+      {%- if carlos_log_view_allow_cidr == 'rfc1918' -%}
+      {{ '{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }' }}
+      {%- elif carlos_log_view_allow_cidr -%}
+      {#- nft anonymous sets REQUIRE braces: the asserts bless a bare
+          comma list (10.0.0.0/24,10.1.0.0/24), which would render an
+          `ip saddr a,b` parse error and abort the fail-closed nft apply
+          mid-play — normalize it to a braced set here. -#}
+      {%- set _lv = carlos_log_view_allow_cidr | trim -%}
+      {{ ('{ ' ~ _lv ~ ' }') if (',' in _lv and not _lv.startswith('{')) else _lv }}
+      {%- elif _bind_ipv4.address is defined and _bind_ipv4.netmask is defined -%}
+      {#- address+netmask works for a primary ipv4 dict AND a secondary (which
+          carries no `prefix` key) — normalize both to network/prefix CIDR. -#}
+      {{ (_bind_ipv4.address ~ '/' ~ _bind_ipv4.netmask) | ansible.utils.ipaddr('network/prefix') }}
+      {%- else -%}
+      {%- endif -%}
+
+- name: Refuse an underivable log-view subnet (fail closed on the PHI log view)
+  ansible.builtin.assert:
+    that: >-
+      (not carlos_log_view_filter_enabled | bool)
+      or (carlos_log_view_allow | trim | length > 0)
+    fail_msg: >-
+      cannot derive the subnet of carlos_bind_ip={{ carlos_bind_ip }} and
+      carlos_log_view_allow_cidr is unset — refusing to leave the PHI-bearing
+      log view reachable from anywhere. Set carlos_log_view_allow_cidr (or
+      'rfc1918' to accept the broad private-ranges fallback).
+  # No `when: carlos_obs_enabled`: carlos_log_view_filter_enabled (and so the
+  # nft `ip saddr <allow>` filter) is derived from BIND_IP REGARDLESS of the
+  # obs profile, so an empty allow-set renders a broken nft rule (front-door
+  # DNAT never installs -> outage) even with obs off. The `that:` no-ops when
+  # the filter is disabled, so this is safe to always evaluate.
+
+# --- directory tree ---------------------------------------------------------------
+- name: Instance directory tree
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default(omit) }}"
+    group: "{{ item.group | default(omit) }}"
+    mode: "{{ item.mode | default('0755') }}"
+  loop:
+    # --- TRAVERSAL PARENTS, FIRST AND EXPLICIT ---------------------------------
+    # `ansible.builtin.file` stamps the item's `mode:` onto every INTERMEDIATE
+    # directory it has to create, and creates them root-owned. On a FRESH host
+    # the first 0700 leaf below therefore used to create $EMR_HOME,
+    # container/, container/conf/ and conf/waf/ as root:root 0700 — and the
+    # ownership sweep further down lists only the LEAVES, so nothing ever
+    # handed those parents over. The rootless engine (which runs as the
+    # service user) then cannot TRAVERSE into any pod-mounted path:
+    #
+    #     Error: statfs .../container/conf/carlos/carlos.properties: permission denied
+    #
+    # i.e. `podman kube play` fails on its first volume and the instance
+    # cannot start at all. Same for data/ (0700 from the mariadb-mnt leaf) and
+    # for logs/ + metrics/ + monitor/, which are deliberately 0750 but were
+    # left group-root. Every previous live verification ran
+    # scripts/dev-setup.sh first, which `mkdir -p`s these parents 0755 — so
+    # the role always found them present and the fresh-install path went
+    # unexercised.
+    #
+    # Declaring the parents FIRST (so no later leaf can create them) with an
+    # explicit owner/group is the fix. The posture per parent:
+    #   - $EMR_HOME, container/, backup/, run/  root:root 0755 — world
+    #     traversal is harmless (their sensitive children carry their own
+    #     restrictive modes) and several root-run tools stat through them.
+    #   - conf/  root:<service user> 0750 — the service user must TRAVERSE it
+    #     (every pod config mount, and the `podman unshare chown` hand-overs
+    #     below) but must NOT own or write it: conf/secrets holds the age
+    #     recipient + encrypted bundle, and a service-user-writable parent
+    #     would let that directory be renamed and replaced (the
+    #     re-encryption-recipient injection vector the secrets dir's own
+    #     root ownership exists to close).
+    #   - data/, logs/, metrics/  <service user> 0750 — the pods write inside
+    #     them and every child is service-user-owned anyway; no other local
+    #     account has business traversing PHI/PHI-adjacent trees.
+    #   - monitor/  root:root 0750 — root-only (monitor + alert throttle
+    #     stamps); no container ever reads it.
+    - {path: "{{ carlos_emr_home }}"}
+    - {path: "{{ carlos_emr_home }}/container"}
+    - {path: "{{ carlos_conf_dir }}", group: "{{ carlos_service_user }}", mode: "0750"}
+    - {path: "{{ carlos_conf_dir }}/waf"}
+    - {path: "{{ carlos_data_dir }}", owner: "{{ carlos_service_user }}",
+       group: "{{ carlos_service_user }}", mode: "0750"}
+    - {path: "{{ carlos_emr_home }}/logs", owner: "{{ carlos_service_user }}",
+       group: "{{ carlos_service_user }}", mode: "0750"}
+    - {path: "{{ carlos_emr_home }}/metrics", owner: "{{ carlos_service_user }}",
+       group: "{{ carlos_service_user }}", mode: "0750"}
+    - {path: "{{ carlos_emr_home }}/monitor", mode: "0750"}
+    - {path: "{{ carlos_emr_home }}/backup"}
+    - {path: "{{ carlos_emr_home }}/run"}
+    - {path: "{{ carlos_conf_dir }}/waf/certs", mode: "0700"}
+    - {path: "{{ carlos_conf_dir }}/tomcat"}
+    - {path: "{{ carlos_conf_dir }}/mariadb"}
+    - {path: "{{ carlos_conf_dir }}/carlos"}
+    - {path: "{{ carlos_conf_dir }}/drugref"}
+    - {path: "{{ carlos_conf_dir }}/vector"}
+    - {path: "{{ carlos_conf_dir }}/caddy"}
+    - {path: "{{ carlos_conf_dir }}/restic"}
+    - {path: "{{ carlos_conf_dir }}/metrics"}
+    - {path: "{{ carlos_conf_dir }}/vmagent"}
+    - {path: "{{ carlos_conf_dir }}/vmalert"}
+    # Root-owned 0755: the dir and the ENCRYPTED bundle must be readable by
+    # the rootless restic backup but never WRITABLE by the service user (a
+    # writable recipient/bundle is a re-encryption-recipient injection vector).
+    - {path: "{{ carlos_secrets_dir }}"}
+    # PHI at rest: the live datadir and the binlog stream (every INSERT's
+    # values in plaintext) — no reason for other host accounts to traverse.
+    # Only the service user (who owns them after the ownership sweep) and
+    # root ever need in.
+    - {path: "{{ carlos_data_dir }}/mariadb-mnt", mode: "0700"}
+    - {path: "{{ carlos_data_dir }}/mariadb-binlog", mode: "0700"}
+    # Blank-datadir guard flags (read-only-mounted into db-init): 0755 so the
+    # rootless pod (container root == service user) can read them.
+    - {path: "{{ carlos_emr_home }}/container/guard"}
+    # PHI-ADJACENT log/metric/buffer trees: 0750, not world-traversable. The
+    # containers access each as the (subuid-mapped) OWNER the ownership sweep
+    # /init chowns it to, so dropping the world bit denies an arbitrary local
+    # host account without affecting the pod. The vector buffer notably holds
+    # the UNREDACTED stream (redaction is applied in the sink, after buffering).
+    # (logs/ and metrics/ themselves are declared with the traversal parents.)
+    - {path: "{{ carlos_emr_home }}/logs/carlos", mode: "0750"}
+    - {path: "{{ carlos_emr_home }}/logs/victoria-logs-data", mode: "0750"}
+    - {path: "{{ carlos_emr_home }}/logs/vector-collector-data", mode: "0750"}
+    - {path: "{{ carlos_emr_home }}/metrics/victoria-metrics-data", mode: "0750"}
+    - {path: "{{ carlos_emr_home }}/metrics/vmagent-buffer", mode: "0750"}
+    - {path: "{{ carlos_emr_home }}/backup/restic-cache"}
+    # Monitor/alert throttle stamps. Pre-created so the sandboxed
+    # <instance>-alert@.service (ProtectSystem=full makes /usr read-only —
+    # the default EMR_HOME is under it) can be granted ReadWritePaths= on an
+    # existing directory and persist its per-unit throttle stamp; without a
+    # writable stamp every failing 15-minute timer re-pages (the alert-fatigue
+    # flood the throttle exists to collapse).
+    - {path: "{{ carlos_emr_home }}/monitor/state", mode: "0750"}
+    # db-backup snapshots are plaintext PHI — 0700.
+    - {path: "{{ carlos_emr_home }}/backup/mariadb-hot", mode: "0700"}
+    # Host-visible MariaDB admin socket path — explicit 0755.
+    - {path: "{{ carlos_db_socket_dir }}"}
+    # Root-only home for the age PRIVATE key — deliberately OUTSIDE container/
+    # so it is never chown-swept, pod-mounted, or backed up.
+    - {path: "{{ carlos_secrets_private_dir }}", mode: "0700"}
+    - {path: "{{ carlos_emr_home }}/build"}
+
+# --- data adoption (pre-existing EMR_HOME; no-ops on a fresh one) ------------------
+- name: Detect an OpenO-era document directory
+  ansible.builtin.stat:
+    path: "{{ carlos_data_dir }}/OpenoDocument"
+  register: _openo_docs
+
+- name: Detect the current document directory
+  ansible.builtin.stat:
+    path: "{{ carlos_data_dir }}/OscarDocument"
+  register: _oscar_docs
+
+- name: Rename OpenoDocument -> OscarDocument (one-time migration)
+  ansible.builtin.command:
+    cmd: mv "{{ carlos_data_dir }}/OpenoDocument" "{{ carlos_data_dir }}/OscarDocument"
+  # The when-gate admits only the one state where the rename happens.
+  changed_when: true
+  when: _openo_docs.stat.isdir | default(false) and not _oscar_docs.stat.exists
+
+# PHI at rest (scanned charts, referral letters) — same 0700 posture as the
+# MariaDB datadir; only the service user and root need in.
+- name: Ensure the document store exists
+  ansible.builtin.file:
+    path: "{{ carlos_data_dir }}/OscarDocument"
+    state: directory
+    mode: "0700"
+
+# --- run-secrets tmpfs + persistence ------------------------------------------------
+- name: Sealed-fragment landing zone (/run tmpfs, service-user-owned 0700)
+  # Holds decrypted DB-credential fragments — a default-umask mkdir would
+  # leave it world-traversable.
+  ansible.builtin.file:
+    path: "{{ carlos_run_secrets_dir }}"
+    state: directory
+    mode: "0700"
+    owner: "{{ carlos_service_user }}"
+
+- name: Persist the run-secrets dir across reboots (tmpfiles.d)
+  ansible.builtin.copy:
+    dest: "{{ carlos_tmpfiles_dir }}/{{ carlos_instance }}-emr.conf"
+    mode: "0644"
+    content: "d {{ carlos_run_secrets_dir }} 0700 {{ carlos_service_user }} {{ carlos_service_user }} -\n"
+
+# --- verbatim confs (operator-owned after first install) ---------------------------
+- name: Install verbatim conf files (never overwritten — local edits survive)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../conf/{{ item }}"
+    dest: "{{ carlos_conf_dir }}/{{ item }}"
+    mode: "0644"
+    force: false
+  loop:
+    - tomcat/server.xml
+    - tomcat/context.xml
+    - tomcat/logging.properties
+    - drugref/server.xml
+    - mariadb/zz-carlos.cnf
+    - waf/RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf
+    - waf/nginx-headers.conf
+
+# --- security-baseline drift detection (force:false means hardening updates
+#     do NOT auto-apply to an existing install; surface divergence so a
+#     security fix to these files is never silently withheld). Additive checks
+#     only — they never modify a file, so they cannot clobber operator edits. --
+- name: Checksum the installed security-critical confs (target side)
+  ansible.builtin.stat:
+    path: "{{ carlos_conf_dir }}/{{ item }}"
+    checksum_algorithm: sha1
+  loop: &carlos_sec_confs
+    - tomcat/server.xml
+    - drugref/server.xml
+    - mariadb/zz-carlos.cnf
+    - waf/nginx-headers.conf
+    - waf/RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf
+  register: _carlos_sec_dst
+  failed_when: false
+
+- name: Checksum the shipped security-critical baseline (controller side)
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/../conf/{{ item }}"
+    checksum_algorithm: sha1
+  delegate_to: localhost
+  # The baseline lives in the repo checkout on the controller — read it as the
+  # invoking user, not root (become at play level would otherwise sudo on the
+  # control node for no reason). No failed_when:false: stat already reports a
+  # missing path as exists=false, so the only thing it would mask is a real
+  # permission/IO error on the repo — which SHOULD surface, not hide the drift
+  # check behind a silent skip.
+  become: false
+  loop: *carlos_sec_confs
+  register: _carlos_sec_src
+
+- name: Warn when an installed security-critical conf diverges from the shipped baseline
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ item.0.item }} on this host differs from the shipped hardened
+      baseline. These files install with force:false (operator edits survive),
+      so a security fix to TLS/connectors, the MariaDB loopback bind, or the
+      WAF headers/CRS exclusions is NOT auto-applied on upgrade. Review
+      conf/{{ item.0.item }} in the repo and reconcile by hand.
+  loop: "{{ _carlos_sec_dst.results | zip(_carlos_sec_src.results) | list }}"
+  loop_control:
+    label: "{{ item.0.item }}"
+  when:
+    - item.0.stat.exists | default(false)
+    - item.1.stat.exists | default(false)
+    - item.0.stat.checksum | default('') != item.1.stat.checksum | default('')
+
+# --- obs-store basic-auth credential (finding 33) -----------------------------------
+# ONE regenerable credential per instance protects VictoriaLogs/VictoriaMetrics/
+# vmalert (180d of PHI-adjacent logs must not be readable by any local
+# process). Canonical plaintext: the root-only 0600 file below, OUTSIDE the
+# pod-mounted/backed-up container/ tree. Never sealed — a playbook re-run
+# mints a fresh one and re-renders every consumer.
+- name: Check for the obs http credential
+  ansible.builtin.stat:
+    path: "{{ carlos_secrets_private_dir }}/obs-http-password"
+  register: _obs_pw_stat
+  when: carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+
+- name: Generate/write the obs http credential (root-only)
+  ansible.builtin.copy:
+    dest: "{{ carlos_secrets_private_dir }}/obs-http-password"
+    content: >-
+      {{ carlos_obs_http_password
+         or lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}
+    owner: root
+    group: root
+    mode: "0600"
+    # Never regenerate over an existing credential unless the operator SET
+    # one: a random re-mint would desynchronize a running stack until play.
+    force: "{{ carlos_obs_http_password | length > 0 }}"
+  register: _obs_pw_write
+  no_log: true
+  when: >-
+    carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+    and (carlos_obs_http_password | length > 0
+         or not (_obs_pw_stat.stat.exists | default(false)))
+
+- name: Read the obs http credential
+  ansible.builtin.slurp:
+    src: "{{ carlos_secrets_private_dir }}/obs-http-password"
+  register: _obs_pw_slurp
+  no_log: true
+  # Read-only; must run in --check too (renders below consume it). On a
+  # fresh host in check mode the file was never written — tolerated below.
+  check_mode: false
+  failed_when: false
+  when: carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+
+- name: Record the effective obs http credential
+  ansible.builtin.set_fact:
+    carlos_obs_http_password_effective: >-
+      {{ (_obs_pw_slurp.content | default('' | b64encode) | b64decode) | trim }}
+  no_log: true
+  when: carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+
+- name: The obs http credential must not silently read empty (finding S20)
+  # Every consumer below (podman secret refresh, journald-collector render,
+  # Caddyfile auth wiring) is gated on `length > 0`, so a FAILED slurp of an
+  # existing credential file used to degrade to "silently skip the auth
+  # wiring": stores 401, log shipping stalls, no error anywhere. If the file
+  # exists (or was just written this run), an empty decoded value is a read
+  # failure — abort loudly instead of deploying half-wired auth. A fresh
+  # host in --check mode legitimately has no file yet (both conditions
+  # false) and still passes.
+  ansible.builtin.assert:
+    that: carlos_obs_http_password_effective | length > 0
+    fail_msg: >-
+      the obs http credential at
+      {{ carlos_secrets_private_dir }}/obs-http-password exists but read back
+      EMPTY — refusing to continue: the obs-store auth consumers would all
+      silently skip their wiring (stores 401, log shipping stalls). Inspect
+      the file (root-only 0600, non-empty) and re-run.
+  no_log: true
+  when: >-
+    carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+    and not ansible_check_mode
+    and ((_obs_pw_stat.stat.exists | default(false))
+         or (_obs_pw_write is defined and _obs_pw_write is changed))
+
+- name: Check for the obs-http podman secret
+  ansible.builtin.command:
+    cmd: >-
+      runuser -u {{ carlos_service_user }} -- env
+      XDG_RUNTIME_DIR=/run/user/{{ carlos_service_uid }}
+      podman secret exists {{ carlos_instance }}-obs-http
+  register: _obs_secret
+  failed_when: false
+  changed_when: false
+  check_mode: false  # read-only probe — see the db-secret probe below
+  when: carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+
+- name: Create/refresh the obs-http podman secret (kube-play manifest on stdin)
+  # Recreated whenever the credential file changed (rm is tolerant of the
+  # secret being in use — the pods pick the new value up at the next play).
+  ansible.builtin.shell: |
+    set -euo pipefail
+    b64="$(printf '%s' "$OBS_HTTP_PASSWORD" | base64 -w0)"
+    runuser -u {{ carlos_service_user }} -- env \
+      XDG_RUNTIME_DIR=/run/user/{{ carlos_service_uid }} \
+      podman secret rm {{ carlos_instance }}-obs-http 2>/dev/null || true
+    runuser -u {{ carlos_service_user }} -- env \
+      XDG_RUNTIME_DIR=/run/user/{{ carlos_service_uid }} \
+      podman kube play - <<EOF
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: {{ carlos_instance }}-obs-http
+    data:
+      password: $b64
+    EOF
+  args:
+    executable: /bin/bash
+  environment:
+    OBS_HTTP_PASSWORD: "{{ carlos_obs_http_password_effective }}"
+  no_log: true
+  # The when-gate admits only missing-secret or changed-credential states,
+  # and the rm+create always rewrites in those states.
+  changed_when: true
+  when: >-
+    carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+    and (carlos_obs_http_password_effective | default('') | length > 0)
+    and (_obs_secret.rc | default(1) != 0
+         or (_obs_pw_write is defined and _obs_pw_write is changed))
+
+# --- per-instance rendered configs (playbook-owned) ---------------------------------
+- name: Render the scrape + vmalert configs (obs profile)
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - {src: scrape.yml.j2, dest: "{{ carlos_conf_dir }}/vmagent/scrape.yml"}
+    - {src: vmalert-rules.yml.j2, dest: "{{ carlos_conf_dir }}/vmalert/rules.yml"}
+  when: carlos_obs_enabled | bool
+
+- name: Render the journald collector config (0600 — carries the store credential)
+  # Vector's http sink has no password_file hook and ${ENV} interpolation
+  # would leak the credential into the 0644 pod spec — inline in a 0600
+  # SERVICE-USER-owned config (the vector container, rootless uid 0 == the
+  # service user, must still read it) is the only channel honoring both.
+  ansible.builtin.template:
+    src: journald-collector.toml.j2
+    dest: "{{ carlos_conf_dir }}/vector/journald-collector.toml"
+    owner: "{{ carlos_service_user }}"
+    mode: "0600"
+  no_log: true
+  # In --check on a fresh host the service user was never created — the
+  # owner lookup fails there only.
+  ignore_errors: "{{ ansible_check_mode }}"
+  when: carlos_obs_enabled | bool
+
+# --- container resolv.conf (podman DNS workaround, podman #20562/#9132) -------------
+- name: Read the host resolv.conf
+  ansible.builtin.slurp:
+    src: /etc/resolv.conf
+  register: _host_resolv
+  failed_when: false
+
+- name: Detect the systemd-resolved stub
+  ansible.builtin.set_fact:
+    _resolved_stub: >-
+      {{ (_host_resolv.content | default('') | b64decode)
+         is search('(?m)^\s*nameserver\s+127\.0\.0\.53') }}
+
+- name: Refuse a stub resolv.conf with no POD_DNS
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: host /etc/resolv.conf points at the systemd-resolved stub
+      127.0.0.53, unreachable inside the pod — CARLOS outbound DNS
+      (Teleplan/HRM/MCEDT) will fail. Set carlos_pod_dns to real upstream
+      nameservers and re-run, or hand-edit
+      {{ carlos_conf_dir }}/tomcat/resolv.conf
+  when: _resolved_stub | bool and not carlos_pod_dns
+
+- name: Write the container resolv.conf (carlos container only — the waf must
+        keep podman's generated one, which carries aardvark-dns)
+  ansible.builtin.copy:
+    dest: "{{ carlos_conf_dir }}/tomcat/resolv.conf"
+    mode: "0644"
+    force: false
+    content: >-
+      {{ carlos_pod_dns
+         and (carlos_pod_dns | replace(',', ' ') | split | map('regex_replace', '^(.*)$', 'nameserver \1') | join('\n')) ~ '\n'
+         or (_host_resolv.content | default('' | b64encode) | b64decode) }}
+
+# Drift review for the operator-owned resolv.conf (finding C22): force:false
+# means a later carlos_pod_dns (or host resolver) change silently never
+# reaches the installed file — outbound integrations (Teleplan/HRM/MCEDT)
+# keep resolving against stale servers with no signal. Same warn-only shape
+# as the security-conf drift block: never clobbers the operator's file.
+- name: Read the installed container resolv.conf (drift probe)
+  ansible.builtin.slurp:
+    src: "{{ carlos_conf_dir }}/tomcat/resolv.conf"
+  register: _installed_resolv
+  failed_when: false
+  check_mode: false
+
+- name: WARN when the installed resolv.conf drifted from the would-render content
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ carlos_conf_dir }}/tomcat/resolv.conf (operator-owned,
+      never clobbered) no longer matches what this play would render — a
+      changed carlos_pod_dns / host resolver is NOT live in the carlos
+      container. Review and hand-merge, then restart the app pod
+      ('carlos-ctl play').
+  vars:
+    _resolv_want: >-
+      {{ carlos_pod_dns
+         and (carlos_pod_dns | replace(',', ' ') | split | map('regex_replace', '^(.*)$', 'nameserver \1') | join('\n')) ~ '\n'
+         or (_host_resolv.content | default('' | b64encode) | b64decode) }}
+  when:
+    - _installed_resolv.content is defined
+    - (_installed_resolv.content | b64decode) != _resolv_want
+
+# --- the site env file (playbook-owned; THE runtime contract) ------------------------
+# no_log: the render carries CARLOS_DB_ROOT_PASSWORD, and the documented
+# preview flow (`ansible-playbook --check --diff`) would otherwise print the
+# plaintext root password to the terminal / CI log.
+- name: Render carlos-app.env
+  ansible.builtin.template:
+    src: carlos-app.env.j2
+    dest: "{{ carlos_emr_home }}/container/carlos-app.env"
+    mode: "0600"
+    owner: root
+    group: root
+  no_log: true
+
+# --- app properties (operator-owned after first render) ------------------------------
+- name: Resolve the Tomcat keystore passwords (generated when unset — must not
+        stay the well-known 'changeit'; inert until Sharing Center is enabled)
+  ansible.builtin.set_fact:
+    _keystore_pw: >-
+      {{ carlos_tomcat_keystore_password
+         or lookup('password', '/dev/null length=24 chars=ascii_letters,digits') }}
+    _truststore_pw: >-
+      {{ carlos_tomcat_truststore_password
+         or lookup('password', '/dev/null length=24 chars=ascii_letters,digits') }}
+  no_log: true
+
+# PIN-encryption default: CLEARTEXT ('no'), on a fresh datadir as well as an
+# existing one. host_vars carlos_pin_encrypted overrides either way.
+#
+# This used to derive 'yes' for a fresh datadir, on the reasoning that a fresh
+# install has "no stored PINs to break". That premise is FALSE and it broke
+# first login on every new site: provisioning runs BEFORE the schema load, and
+# the schema load is what creates the bootstrap administrator — the Flyway seed
+# (migration/on/V1.0.2__on_data.sql and the BC equivalent) inserts `carlosdoc`
+# with a CLEARTEXT pin. LoginCheckLoginBean.authenticate() encrypts the
+# SUBMITTED pin before comparing it to the stored one, so with IS_PIN_ENCRYPTED=yes
+# the comparison can never match: the seeded account is refused with
+# "Pin-local needed" and QUICKSTART step 5 / the README's "First login" are
+# unreachable. Verified live on a fresh Ontario install — login went from
+# `302 -> /carlos/index?login=failed` to `302 -> /carlos/provider/providercontrol`
+# the moment the stored PIN was converted to the encrypted form.
+#
+# Choosing cleartext costs nothing real: Misc.encryptPIN is a @Deprecated
+# non-cryptographic running-sum over the characters ("Do not rely on this for
+# securing sensitive data" — its own javadoc), trivially reversible and
+# unsalted, so 'yes' is obfuscation, not protection. Matching what upstream's
+# own seed data writes is the honest default; sites that want the legacy
+# obfuscation set carlos_pin_encrypted: 'yes' AND must then re-set every
+# seeded PIN themselves.
+- name: Detect an initialized MariaDB datadir (recorded for operator diagnostics)
+  ansible.builtin.stat:
+    path: "{{ carlos_data_dir }}/{{ carlos_datadir_signature }}"
+  register: _pin_datadir
+
+- name: Render carlos.properties (once; edit the file afterwards, then play)
+  ansible.builtin.template:
+    src: carlos.properties.j2
+    dest: "{{ carlos_conf_dir }}/carlos/carlos.properties"
+    mode: "0600"
+    force: false
+  vars:
+    carlos_tomcat_keystore_password: "{{ _keystore_pw }}"
+    carlos_tomcat_truststore_password: "{{ _truststore_pw }}"
+    # Boolean-form default(…, true): carlos_pin_encrypted defaults to "" in
+    # defaults/main.yml, which is DEFINED — the single-arg default() never
+    # fired, so the effective var rendered empty and IS_PIN_ENCRYPTED= came
+    # out blank (CARLOS reads that as "not yes" = cleartext PINs on every
+    # fresh install). The second arg makes the default cover empty strings.
+    carlos_pin_encrypted_effective: "{{ carlos_pin_encrypted | default('no', true) }}"
+  no_log: true
+
+# --- encryption-key migration (operator-owned file, ADDITIVE only) -----------------
+# Existing installs rendered carlos.properties before encryption.util.secret.key
+# existed; the render above is create-once, so their on-disk file never gains
+# the line — and current CARLOS develop fails first boot without it once the
+# image is rebuilt (the app tries to generate-and-persist a key into the
+# read-only mounted config). Append the key ONLY when no key line of any value
+# exists: an operator-supplied line is never touched — the same additive-only
+# contract as the Caddyfile store-auth migration below. Safe to add blind:
+# pre-key images could never persist a key into this deployment's read-only
+# config, so no on-disk value can exist for the append to conflict with.
+- name: Probe the installed carlos.properties for the encryption key line
+  ansible.builtin.stat:
+    path: "{{ carlos_conf_dir }}/carlos/carlos.properties"
+  register: _carlos_props_stat
+
+- name: Read the installed carlos.properties (encryption-key migration probe)
+  ansible.builtin.slurp:
+    src: "{{ carlos_conf_dir }}/carlos/carlos.properties"
+  register: _carlos_props_body
+  no_log: true
+  when: _carlos_props_stat.stat.exists | default(false)
+
+- name: Add encryption.util.secret.key to a pre-key carlos.properties (append-only)
+  ansible.builtin.lineinfile:
+    path: "{{ carlos_conf_dir }}/carlos/carlos.properties"
+    line: "encryption.util.secret.key={{ carlos_encryption_secret_key }}"
+    insertafter: EOF
+  no_log: true
+  when: >-
+    (_carlos_props_stat.stat.exists | default(false))
+    and ((_carlos_props_body.content | default('') | b64decode)
+         is not search('(?m)^\s*encryption\.util\.secret\.key\s*='))
+
+- name: Render drugref2.properties (once)
+  ansible.builtin.template:
+    src: drugref2.properties.j2
+    dest: "{{ carlos_conf_dir }}/drugref/drugref2.properties"
+    mode: "0600"
+    force: false
+  no_log: true
+
+- name: Render exporter.my.cnf (fail-closed placeholder; db-users writes the
+        real least-privilege exporter creds)
+  ansible.builtin.template:
+    src: exporter.my.cnf.j2
+    dest: "{{ carlos_conf_dir }}/metrics/exporter.my.cnf"
+    mode: "0600"
+    force: false
+  when: carlos_obs_enabled | bool
+
+# --- log view credentials (obs profile; only the bcrypt hash on disk) -----------------
+- name: Check for an existing Caddyfile
+  ansible.builtin.stat:
+    path: "{{ carlos_conf_dir }}/caddy/Caddyfile"
+  register: _caddyfile
+  when: carlos_obs_enabled | bool
+
+- name: Render the log-view Caddyfile (once; rotate with 'carlos-ctl rotate log-view')
+  when: carlos_obs_enabled | bool and not (_caddyfile.stat.exists | default(false))
+  block:
+    - name: Generate a log-view password when none is set
+      ansible.builtin.set_fact:
+        _lv_password: >-
+          {{ carlos_log_view_password
+             or lookup('password', '/dev/null length=24 chars=ascii_letters,digits') }}
+        _lv_generated: "{{ not carlos_log_view_password }}"
+      no_log: true
+
+    - name: Render the Caddyfile with the bcrypt hash
+      # password_hash('bcrypt') runs on the CONTROL NODE (needs passlib) — the
+      # plaintext never crosses to the host, only the hash does.
+      ansible.builtin.template:
+        src: Caddyfile.j2
+        dest: "{{ carlos_conf_dir }}/caddy/Caddyfile"
+        mode: "0600"
+      vars:
+        carlos_log_view_hash: "{{ _lv_password | password_hash('bcrypt') }}"
+      no_log: true
+
+    # Write the generated password to a ROOT-ONLY 0600 file rather than
+    # echoing it: an ansible.builtin.debug msg lands in AWX/CI/`ansible-
+    # playbook -v` job logs in plaintext. The operator reads it once off the
+    # host, then shreds the file. (Only when we generated it — an
+    # operator-supplied password is never written back.)
+    - name: Stage the generated log-view password for one-time pickup (root-only)
+      ansible.builtin.copy:
+        dest: "{{ carlos_secrets_private_dir }}/.new-log-view-password"
+        content: >-
+          log view login — user: {{ carlos_log_view_user }}
+          password: {{ _lv_password }}
+        mode: "0600"
+        owner: root
+        group: root
+      no_log: true
+      when: _lv_generated | bool
+
+    - name: Point the operator at the staged log-view password
+      ansible.builtin.debug:
+        msg: >-
+          Generated a log-view password — read it ONCE from
+          {{ carlos_secrets_private_dir }}/.new-log-view-password (root, 0600),
+          store it in your password manager, then shred that file. Only the
+          bcrypt hash is kept on disk.
+      when: _lv_generated | bool
+
+# --- Caddyfile store-auth migration (operator-owned file, ADDITIVE only) ------------
+# Existing installs rendered the pre-auth Caddyfile (one-line reverse_proxy,
+# no upstream Authorization). The stores now require basic auth, so the view
+# would 401 on every query. Two idempotent rewrites: one-line -> block form
+# with the header (the one-line pattern no longer matches after the rewrite),
+# then a refresh of any existing header to the current credential (rotation/
+# regeneration convergence). Operator restructures beyond that get a warning
+# naming the exact line to add, never a clobber.
+- name: Migrate the existing Caddyfile's store routes to authenticated form
+  ansible.builtin.replace:
+    path: "{{ carlos_conf_dir }}/caddy/Caddyfile"
+    regexp: '^(\s*)reverse_proxy 127\.0\.0\.1:(9428|8428)$'
+    replace: >-
+      \1reverse_proxy 127.0.0.1:\2 {\n\1\theader_up Authorization
+      "Basic {{ (carlos_obs_http_user ~ ':' ~ carlos_obs_http_password_effective) | b64encode }}"\n\1}
+  no_log: true
+  when: >-
+    carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+    and (_caddyfile.stat.exists | default(false))
+    and (carlos_obs_http_password_effective | default('') | length > 0)
+
+- name: Refresh the Caddyfile's upstream store credential
+  ansible.builtin.replace:
+    path: "{{ carlos_conf_dir }}/caddy/Caddyfile"
+    regexp: '(header_up Authorization "Basic )[A-Za-z0-9+/=]*(")'
+    replace: '\g<1>{{ (carlos_obs_http_user ~ ":" ~ carlos_obs_http_password_effective) | b64encode }}\g<2>'
+  no_log: true
+  when: >-
+    carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+    and (_caddyfile.stat.exists | default(false))
+    and (carlos_obs_http_password_effective | default('') | length > 0)
+
+- name: Read the Caddyfile back for the auth-coverage advisory
+  ansible.builtin.slurp:
+    src: "{{ carlos_conf_dir }}/caddy/Caddyfile"
+  register: _caddyfile_body
+  failed_when: false
+  no_log: true
+  when: carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+
+- name: Warn when the Caddyfile still lacks the upstream store credential
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ carlos_conf_dir }}/caddy/Caddyfile carries no
+      'header_up Authorization "Basic ..."' inside its reverse_proxy blocks —
+      the stores now require basic auth (carlos_obs_http_auth), so the log
+      view will 401 on every query. Add the header_up line to each
+      reverse_proxy block (value: base64 of
+      '{{ carlos_obs_http_user }}:<obs-http-password>'), or re-render by
+      moving your customized Caddyfile aside and re-running the playbook.
+  when: >-
+    carlos_obs_enabled | bool and carlos_obs_http_auth | bool
+    and (_caddyfile_body.content is defined)
+    and ('header_up Authorization' not in (_caddyfile_body.content | b64decode))
+
+# --- restic credentials (regenerate ONLY when no credential exists in ANY store) ------
+- name: Check restic credential stores
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+  loop:
+    - {path: "{{ carlos_conf_dir }}/restic/restic.env", name: plain}
+    - {path: "{{ carlos_credstore_dir }}/{{ carlos_cred_restic }}.cred", name: legacy}
+    - {path: "{{ carlos_secrets_bundle }}", name: bundle}
+  register: _restic_stores
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Render restic.env (a sealed credential supersedes the plaintext file —
+        regenerating over a sealed install would mint a password that no
+        longer opens the existing repository)
+  ansible.builtin.template:
+    src: restic.env.j2
+    dest: "{{ carlos_conf_dir }}/restic/restic.env"
+    mode: "0600"
+  vars:
+    carlos_restic_password_effective: >-
+      {{ carlos_restic_password
+         or lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}
+  no_log: true
+  when: _restic_stores.results | map(attribute='stat.exists') | select | list | length == 0
+
+- name: Remind the operator to escrow the restic credentials
+  ansible.builtin.debug:
+    msg: >-
+      copy RESTIC_PASSWORD from {{ carlos_conf_dir }}/restic/restic.env to a
+      safe place OFF this host — without it backups are unreadable. The
+      default repository is LOCAL; for a real DR posture set
+      carlos_restic_repository to an OFFSITE backend (s3:/rest:/sftp:/b2:).
+  when: _restic_stores.results | map(attribute='stat.exists') | select | list | length == 0
+
+# --- age keypair (single-master secrets root) ------------------------------------------
+# No failed_when:false — `creates:` handles idempotency, and a genuinely
+# failed keygen must fail HERE, not surface later as an opaque seal error.
+- name: Generate the instance age keypair (idempotent; seal TPM-seals + shreds it)
+  ansible.builtin.command:
+    cmd: age-keygen -o {{ carlos_age_key_file }}
+    creates: "{{ carlos_age_key_file }}"
+  register: _age_keygen
+  when: >-
+    not (_restic_stores.results | selectattr('item.name', 'eq', 'bundle')
+         | map(attribute='stat.exists') | first | default(false))
+
+# Stat-gated instead of failed_when:false: the clamp legitimately no-ops
+# when the key was TPM-sealed + shredded (file absent), but a REAL chmod/
+# chown failure on a present key must be loud — a swallowed one leaves the
+# secrets-root private key at whatever mode/owner it happened to have.
+- name: Check for the age key file
+  ansible.builtin.stat:
+    path: "{{ carlos_age_key_file }}"
+  register: _age_key_stat
+
+- name: Clamp the age key mode
+  ansible.builtin.file:
+    path: "{{ carlos_age_key_file }}"
+    mode: "0600"
+    owner: root
+    group: root
+  when: _age_key_stat.stat.exists
+
+- name: Derive the public recipient
+  # Gated on the KEY FILE existing, not on `_age_keygen is not skipped`
+  # (finding C22): after a partial run that created the key but died before
+  # this task, every later run skipped keygen (creates: satisfied) so the
+  # old gate skipped the derivation FOREVER — the recipient file stayed
+  # missing and `carlos-ctl seal` failed opaquely. `creates:` keeps the
+  # task idempotent; a sealed+shredded key (file absent, recipient already
+  # derived) correctly no-ops both conditions.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    sed -n 's/^# public key: //p' "{{ carlos_age_key_file }}" | head -n1 \
+      > "{{ carlos_age_pub_file }}"
+    chmod 0644 "{{ carlos_age_pub_file }}"
+  args:
+    executable: /bin/bash
+    creates: "{{ carlos_age_pub_file }}"
+  when: _age_key_stat.stat.exists
+
+# --- pod specs, units, quadlets (playbook-owned) ----------------------------------------
+- name: Render the pod specs
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ carlos_emr_home }}/container/{{ item.dest }}"
+    # No plaintext secrets in the specs (the db secret is referenced by NAME) —
+    # 0644 so the rootless restic file backup can read them.
+    mode: "0644"
+  loop: >-
+    {{ [{'src': 'carlos-app.yaml.j2', 'dest': carlos_app_pod ~ '.yaml'},
+        {'src': 'carlos-waf.yaml.j2', 'dest': carlos_waf_pod ~ '.yaml'}]
+       + ([{'src': 'carlos-obs.yaml.j2', 'dest': carlos_obs_pod ~ '.yaml'}]
+          if carlos_obs_enabled | bool else []) }}
+
+- name: Render the systemd units and timers
+  # NOT rendered here: {{ carlos_instance }}-secrets.service — that unit is
+  # installed and re-rendered by `carlos-ctl seal`, whose TPM state decides
+  # its LoadCredentialEncrypted line.
+  ansible.builtin.template:
+    src: "systemd/carlos-{{ item }}.j2"
+    dest: "{{ carlos_systemd_dir }}/{{ carlos_instance }}-{{ item }}"
+    mode: "0644"
+  loop: >-
+    {{ ['backup.service', 'backup.timer', 'binlog.service', 'binlog.timer',
+        'docs.service', 'docs.timer', 'backup-verify.service',
+        'backup-verify.timer', 'monitor.service', 'monitor.timer',
+        'alert@.service', 'guard.service', 'nft.service']
+       + (['cert-renew.service', 'cert-renew.timer']
+          if carlos_tls_mode == 'acme' else []) }}
+  register: _units_rendered
+  notify: systemd daemon-reload
+
+- name: Adopt changed unit files before deciding what to restart
+  # daemon-reload re-reads changed unit files, but an ALREADY-RUNNING OnCalendar
+  # timer keeps its previously-computed next-elapse until it is restarted — so a
+  # changed BACKUP_ONCALENDAR/BINLOG_ONCALENDAR on a live install would not take
+  # effect until the next (old-schedule) firing. Flush the reload handler now so
+  # the restart decision below sees the reloaded definitions.
+  ansible.builtin.meta: flush_handlers
+
+- name: Probe which changed timers are currently active (target-side)
+  # is-active on the TARGET (a controller-side lookup would query the wrong
+  # host). Restart only timers that are BOTH changed and active: re-arming an
+  # active timer is safe and never touches an in-flight backup .service, while
+  # a not-yet-started timer must stay unstarted (the enable-without-start
+  # invariant that keeps pre-first-play timers from paging).
+  ansible.builtin.command:
+    cmd: "systemctl is-active {{ carlos_instance }}-{{ item.item }}"
+  loop: "{{ _units_rendered.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  register: _timer_active_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when:
+    - item.item is defined
+    - item.item.endswith('.timer')
+    - item.changed | default(false)
+
+- name: Restart changed-and-active timers
+  # ignore_errors (NOT failed_when:false) + the WARNING task below (finding
+  # C22, corrected in review): `failed_when: false` REWRITES each registered
+  # item's `failed` flag to false, which made the WARN below dead code —
+  # `ignore_errors: true` keeps `failed: true` in the register (and prints
+  # the red ...ignored line) while letting the play continue. A failed
+  # restart used to silently drop a changed OnCalendar: the timer kept
+  # firing on its OLD schedule with zero signal.
+  ansible.builtin.systemd:
+    name: "{{ carlos_instance }}-{{ item.item.item }}"
+    state: restarted
+  loop: "{{ _timer_active_probe.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item | default('(skipped)') }}"
+  register: _timer_restart
+  ignore_errors: true
+  when:
+    - not ansible_check_mode
+    - not (item.skipped | default(false))
+    - (item.stdout | default('')).strip() == 'active'
+
+- name: WARN when a changed timer could not be restarted (old schedule still armed)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ carlos_instance }}-{{ item.item.item.item }} changed on disk
+      but could NOT be restarted — it is still armed with its PREVIOUS
+      OnCalendar and the new schedule will not take effect until you restart
+      it by hand: systemctl restart {{ carlos_instance }}-{{ item.item.item.item }}
+  loop: "{{ _timer_restart.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.item | default('(skipped)') }}"
+  when:
+    - not (item.skipped | default(false))
+    - item.failed | default(false)
+
+# MUST precede the render below: `template` does not create parent
+# directories and no earlier task creates the per-uid quadlet dir — with
+# the order reversed, EVERY fresh install failed at the render (and
+# retries failed identically, since the mkdir never got to run).
+- name: Ensure the quadlet directory exists
+  ansible.builtin.file:
+    path: "{{ carlos_quadlet_root }}/{{ carlos_service_uid }}"
+    state: directory
+    mode: "0755"
+
+- name: Render the Quadlet units (rootless USER units under the service user)
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ carlos_quadlet_root }}/{{ carlos_service_uid }}/{{ item.dest }}"
+    mode: "0644"
+  loop: >-
+    {{ [{'src': 'systemd/carlos.kube.j2', 'dest': carlos_instance ~ '.kube'},
+        {'src': 'systemd/carlos-waf.kube.j2', 'dest': carlos_waf_pod ~ '.kube'}]
+       + ([{'src': 'systemd/carlos-obs.kube.j2', 'dest': carlos_obs_pod ~ '.kube'}]
+          if carlos_obs_enabled | bool else []) }}
+  notify: user daemon-reload
+
+# The build context must carry every file the Containerfiles COPY, or
+# `carlos-ctl build` fails at those steps ("no such file or directory" —
+# found by running a real build against a role-provisioned host; the stub
+# test suite records podman argv and never exercises a real build).
+- name: Build-context conf directories
+  ansible.builtin.file:
+    path: "{{ carlos_emr_home }}/build/conf/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - tomcat
+    - drugref
+
+- name: Install the build context (Containerfiles + COPY'd confs for `carlos-ctl build`)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../{{ item }}"
+    dest: "{{ carlos_emr_home }}/build/{{ item }}"
+    mode: "0644"
+  loop:
+    - Containerfile
+    - Containerfile.drugref
+    # 0-byte placeholder the Containerfiles COPY; `carlos-ctl build` stages the
+    # operator's CARLOS_EXTRA_CA_BUNDLE into it and restores it empty after.
+    - .extra-ca-bundle.crt
+    # Baked into the images as standalone-run defense-in-depth defaults
+    # (Containerfile COPY conf/...). These are the ROLE's pristine copies —
+    # deliberately NOT the operator-editable ones under container/conf (the
+    # pod bind-mounts those at runtime; the baked copies only cover a bare
+    # `podman run` outside the pod spec).
+    - conf/tomcat/server.xml
+    - conf/tomcat/context.xml
+    - conf/drugref/server.xml
+    - conf/drugref/drugref2-context.xml
+
+# --- nftables redirect + log-view filter --------------------------------------------------
+- name: Render the nftables ruleset
+  ansible.builtin.template:
+    src: nat.nft.j2
+    dest: "{{ carlos_emr_home }}/container/{{ carlos_instance }}-nat.nft"
+    mode: "0644"
+  register: _nft_ruleset
+
+- name: Probe whether the front-door nft table is live in the kernel
+  # The rendered file being unchanged does NOT mean the ruleset is loaded: an
+  # external `nft flush ruleset`, a conntrack/netfilter reload, or a missed
+  # boot-time apply can drop the kernel table while the file on disk is
+  # identical — leaving the front door down with nothing to re-apply it until
+  # reboot. Probe the live table so the apply below also fires on that drift.
+  ansible.builtin.command:
+    cmd: nft list table ip {{ carlos_instance }}-nat
+  register: _nft_table_probe
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Apply the nftables ruleset
+  ansible.builtin.command:
+    cmd: nft -f {{ carlos_emr_home }}/container/{{ carlos_instance }}-nat.nft
+  # Re-apply when the rendered ruleset changed OR the kernel table went missing
+  # (declare-then-delete makes -f idempotent, so a redundant apply is a no-op).
+  when: _nft_ruleset.changed or _nft_table_probe.rc != 0  # noqa no-handler — fail-closed check needs the rc here
+  register: _nft_apply
+  failed_when: false
+  changed_when: _nft_apply.rc == 0
+
+- name: Fail closed when the nftables ruleset did not apply
+  # Fail-closed for EVERY profile, not only when the log-view filter is
+  # required: the ruleset also carries the 443->publish-port redirect, so a
+  # swallowed nft failure on a loopback install silently breaks the front
+  # door (and, with the filter enabled, leaves the PHI log view reachable
+  # with NO source restriction). carlos_allow_nft_failure is the explicit
+  # opt-out for hosts where another firewall layer owns these rules.
+  ansible.builtin.assert:
+    that: >-
+      _nft_apply is skipped or _nft_apply.rc == 0
+      or (carlos_allow_nft_failure | default(false) | bool)
+    fail_msg: >-
+      could not apply the nftables ruleset ({{ carlos_instance }}-nat.nft) —
+      the 443 redirect{{ (carlos_log_view_filter_enabled | bool)
+      | ternary(' and the REQUIRED log-view source filter', '') }} did not
+      install. Fix the nft error, or set carlos_allow_nft_failure: true only
+      if another host firewall enforces these rules.
+
+# --- unit enablement -----------------------------------------------------------------------
+- name: Enable the timers WITHOUT starting them
+  # The binlog/docs timers fire every 15 min and the monitor hourly, and all
+  # of them fail (and page, via OnFailure) while no pod exists — the normal
+  # state between provisioning and the first play (image builds, TLS certs,
+  # DrugRef loads routinely take days). `carlos-ctl play` starts them after
+  # the first successful deploy.
+  ansible.builtin.systemd:
+    name: "{{ carlos_instance }}-{{ item }}.timer"
+    enabled: true
+    daemon_reload: true
+  loop: >-
+    {{ ['backup', 'binlog', 'docs', 'backup-verify', 'monitor']
+       + (['cert-renew'] if carlos_tls_mode == 'acme' else []) }}
+  # --check never wrote the unit files, so systemd cannot know them — tolerate
+  # in check mode only (the documented drift review must complete).
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Enable + start the nft redirect unit (host NAT, no pod dependency —
+        rules do not persist across reboots on their own)
+  ansible.builtin.systemd:
+    name: "{{ carlos_instance }}-nft.service"
+    enabled: true
+    state: started
+  ignore_errors: "{{ ansible_check_mode }}"  # see the timers task above
+
+- name: Enable the boot-time blank-datadir guard (WITHOUT --now; the point is
+        the boot ordering before the pod)
+  ansible.builtin.systemd:
+    name: "{{ carlos_instance }}-guard.service"
+    enabled: true
+  ignore_errors: "{{ ansible_check_mode }}"  # see the timers task above
+
+# --- rootless engine objects -----------------------------------------------------------------
+- name: Podman networks (shared app<->obs + edge waf->app)
+  # The waf pod deliberately does NOT join the shared net — the obs stores are
+  # unauthenticated HTTP (PHI logs) and must stay out of the internet-facing
+  # container's reach. Non-internal on purpose (outbound + hostPort behavior).
+  ansible.builtin.command:
+    cmd: >-
+      runuser -u {{ carlos_service_user }} -- env
+      XDG_RUNTIME_DIR=/run/user/{{ carlos_service_uid }}
+      podman network create {{ item }}
+  register: _net_create
+  failed_when: _net_create.rc != 0 and 'already exists' not in _net_create.stderr
+  changed_when: _net_create.rc == 0
+  loop:
+    - "{{ carlos_net_name }}"
+    - "{{ carlos_edge_net_name }}"
+
+- name: Check for the db-root podman secret
+  ansible.builtin.command:
+    cmd: >-
+      runuser -u {{ carlos_service_user }} -- env
+      XDG_RUNTIME_DIR=/run/user/{{ carlos_service_uid }}
+      podman secret exists {{ carlos_db_secret }}
+  register: _db_secret
+  failed_when: false
+  changed_when: false
+  # Read-only probe — must run in --check too or the `when` below trips over
+  # an undefined rc and the drift review aborts (the create task itself is
+  # still correctly skipped by check mode).
+  check_mode: false
+
+- name: Create the db-root podman secret (mysql_native_password hash; consulted
+        only when bootstrapping an EMPTY datadir)
+  # The hash is computed in-process from the env var and the manifest travels
+  # over stdin — the password is never an argv token.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    hash="$(python3 - <<'PY'
+    import hashlib, os
+    pw = os.environ["CARLOS_DB_ROOT_PASSWORD"].encode()
+    print("*" + hashlib.sha1(hashlib.sha1(pw).digest()).hexdigest().upper())
+    PY
+    )"
+    b64="$(printf '%s' "$hash" | base64 -w0)"
+    # Create the secret via a kube Secret manifest with the BASE64 hash,
+    # never via a plain podman secret create over a file holding the raw
+    # hash. A mysql_native_password hash always begins with an asterisk, and
+    # a raw-bytes podman secret whose value starts with an asterisk makes a
+    # later podman kube play of the app pod fail with a YAML unknown-anchor
+    # error: kube play re-serializes the referenced secret and reads the
+    # leading asterisk as a YAML alias. The base64 data field avoids that.
+    # Recreate this secret by hand the same way if you ever must.
+    runuser -u {{ carlos_service_user }} -- env \
+      XDG_RUNTIME_DIR=/run/user/{{ carlos_service_uid }} \
+      podman kube play - <<EOF
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: {{ carlos_db_secret }}
+    data:
+      mariadb-root-password-hash: $b64
+    EOF
+  args:
+    executable: /bin/bash
+  environment:
+    CARLOS_DB_ROOT_PASSWORD: "{{ carlos_db_root_password }}"
+  no_log: true
+  # Create-only (the when-gate): whenever this runs, the secret is minted.
+  changed_when: true
+  when: _db_secret.rc | default(1) != 0
+
+- name: Compare host_vars root password to the stored bootstrap secret (drift probe)
+  # The secret above is create-only (bootstrap material for a FRESH datadir
+  # init) — rotating carlos_db_root_password in host_vars never rewrites it,
+  # by design ('carlos-ctl rotate db-root' owns live rotation). But the
+  # silent split bit operators (finding C22): a future fresh-datadir init
+  # would use the OLD password while host_vars says otherwise. Compare the
+  # mysql_native_password hashes (never plaintext) and WARN on mismatch.
+  # Output is only MATCH/MISMATCH; the password rides the environment.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    want="$(python3 - <<'PY'
+    import hashlib, os
+    pw = os.environ["CARLOS_DB_ROOT_PASSWORD"].encode()
+    print("*" + hashlib.sha1(hashlib.sha1(pw).digest()).hexdigest().upper())
+    PY
+    )"
+    b64want="$(printf '%s' "$want" | base64 -w0)"
+    have="$(runuser -u {{ carlos_service_user }} -- env \
+      XDG_RUNTIME_DIR=/run/user/{{ carlos_service_uid }} \
+      podman secret inspect --showsecret \
+      --format '{% raw %}{{.SecretData}}{% endraw %}' {{ carlos_db_secret }} 2>/dev/null || true)"
+    # kube-play-created secrets store the whole manifest (base64 data), a
+    # plain `podman secret create` stores raw bytes — accept either shape.
+    case "$have" in
+      "") echo MATCH ;;                       # unreadable: no verdict, stay quiet
+      *"$want"*|*"$b64want"*) echo MATCH ;;
+      *) echo MISMATCH ;;
+    esac
+  args:
+    executable: /bin/bash
+  environment:
+    CARLOS_DB_ROOT_PASSWORD: "{{ carlos_db_root_password }}"
+  register: _db_secret_drift
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+  when: _db_secret.rc | default(1) == 0
+
+- name: WARN when host_vars and the stored db-root secret have drifted
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: carlos_db_root_password in host_vars no longer matches the
+      stored {{ carlos_db_secret }} podman secret (bootstrap material for a
+      fresh-datadir init). If you rotated the live password, this is expected
+      ONLY if you used 'carlos-ctl rotate db-root' (which rewrites the
+      secret); otherwise a future fresh-datadir initialization would come up
+      with the OLD password. Reconcile: carlos-ctl rotate db-root, or delete
+      the secret and re-run the play to re-mint it from host_vars.
+  when:
+    - _db_secret_drift is not skipped
+    - (_db_secret_drift.stdout | default('')).strip() == 'MISMATCH'
+
+# --- registry entry (runtime metadata for carlos-ctl --instance/instances) --------------------
+- name: Registry directory
+  ansible.builtin.file:
+    path: "{{ carlos_instance_registry_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Write the instance registry entry
+  ansible.builtin.template:
+    src: registry.conf.j2
+    dest: "{{ carlos_instance_registry_dir }}/{{ carlos_instance }}.conf"
+    mode: "0644"
+
+- name: Mirror the alert channels outside EMR_HOME (root-only sidecar)
+  # carlos-app.env carries the alert capability URLs — on the very volume
+  # whose failure-to-mount the boot guard pages about. This mirror keeps the
+  # guard's OnFailure page deliverable when $EMR_HOME is unmounted/blank;
+  # carlos-ctl only consults it for keys whose resolved value is empty.
+  # 0600 root:root and no_log: webhook/heartbeat URLs are bearer capabilities
+  # and must never ride in the 0644 registry entry above.
+  ansible.builtin.template:
+    src: alert.env.j2
+    dest: "{{ carlos_instance_registry_dir }}/{{ carlos_instance }}.alert.env"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+# --- advisory checks carried over from bootstrap ------------------------------------------------
+- name: Read zz-carlos.cnf for the PITR/isolation advisories
+  ansible.builtin.slurp:
+    src: "{{ carlos_conf_dir }}/mariadb/zz-carlos.cnf"
+  register: _dbcnf
+  failed_when: false
+
+- name: Advisories (log_bin / bind_address / page size / TLS certs)
+  ansible.builtin.debug:
+    msg: "{{ item.msg }}"
+  loop:
+    - msg: >-
+        WARNING: no log_bin in zz-carlos.cnf — merge the binlog settings from
+        the repo copy, or database backups stay dump-only (no point-in-time
+        recovery)
+      bad: "{{ (_dbcnf.content | default('' | b64encode) | b64decode) is not search('(?m)^log_bin') }}"
+    - msg: >-
+        WARNING: no bind_address in zz-carlos.cnf — merge
+        'bind_address = 127.0.0.1' from the repo copy, or the WAF pod can
+        still reach MariaDB over the edge network ('carlos-ctl check' flags
+        this; 'carlos-ctl play' refuses it)
+      bad: "{{ (_dbcnf.content | default('' | b64encode) | b64decode) is not search('(?m)^bind_address') }}"
+  loop_control:
+    label: "{{ item.msg[:60] }}"
+  when: item.bad | bool
+
+- name: Check for TLS material
+  ansible.builtin.stat:
+    path: "{{ carlos_conf_dir }}/waf/certs/fullchain.pem"
+  register: _tls_cert
+
+# selfsigned mode (the default): provisioning alone yields a startable WAF.
+# creates: makes it a strict never-clobber — an operator-placed pair (or a
+# previous generation) is never overwritten here; expiry-driven REgeneration
+# of a provably-self-issued pair is `carlos-ctl play`'s job (tlsops).
+- name: Generate the self-signed front-door TLS pair (selfsigned mode)
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -x509
+      - -newkey
+      - rsa:2048
+      - -days
+      - "3650"
+      - -nodes
+      - -subj
+      - "/CN={{ carlos_server_name }}"
+      - -addext
+      - "subjectAltName=DNS:{{ carlos_server_name }},IP:{{ carlos_bind_ip }}"
+      - -keyout
+      - "{{ carlos_conf_dir }}/waf/certs/privkey.pem"
+      - -out
+      - "{{ carlos_conf_dir }}/waf/certs/fullchain.pem"
+    creates: "{{ carlos_conf_dir }}/waf/certs/privkey.pem"
+  when: carlos_tls_mode == 'selfsigned' and not _tls_cert.stat.exists
+  register: _tls_selfsigned
+
+# Deliberately UNCONDITIONAL. With `when: _tls_selfsigned is changed` this
+# re-stat was skipped on every run after the first — and Ansible registers the
+# SKIP RESULT ({changed: false, skipped: true}) into `_tls_cert`, destroying
+# the `.stat` the generation task had put there. The very next task's
+# `when: not _tls_cert.stat.exists` then aborted the whole play with
+# "object of type 'dict' has no attribute 'stat'", so a SECOND playbook run
+# against an already-provisioned selfsigned instance always failed — i.e. the
+# documented "edit host_vars -> re-run the playbook -> carlos-ctl play" loop
+# was broken for every existing install. (--check never caught it: on a fresh
+# check prefix the generation task always reports `changed`, so the skip
+# branch is unreachable there.) A stat costs nothing; run it every time.
+- name: Re-check TLS material after generation
+  ansible.builtin.stat:
+    path: "{{ carlos_conf_dir }}/waf/certs/fullchain.pem"
+  register: _tls_cert
+
+- name: Warn when no TLS cert is staged yet
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: no TLS cert at {{ carlos_conf_dir }}/waf/certs/
+      {fullchain,privkey}.pem — the WAF will not start without one
+      {{ '(acme mode: run carlos-ctl cert-renew once, after DNS points here)'
+         if carlos_tls_mode == 'acme' else '' }}
+  when: not _tls_cert.stat.exists
+
+- name: Create the acme state dirs (certbot etc/lib, acme mode)
+  ansible.builtin.file:
+    path: "{{ carlos_conf_dir }}/waf/acme/{{ item }}"
+    state: directory
+    owner: "{{ carlos_service_user }}"
+    mode: "0700"
+  loop: [etc, lib]
+  when: carlos_tls_mode == 'acme'
+  ignore_errors: "{{ ansible_check_mode }}"  # fresh-host check: no service user yet
+
+# Stat-gated instead of failed_when:false: no-op only when the key is not
+# staged yet (fresh install before the operator places certs); a REAL chmod
+# failure on a present key must be loud.
+- name: Check for the TLS private key
+  ansible.builtin.stat:
+    path: "{{ carlos_conf_dir }}/waf/certs/privkey.pem"
+  register: _tls_key
+
+- name: Clamp the TLS private key mode (0640; the 0700 certs dir is the host gate)
+  ansible.builtin.file:
+    path: "{{ carlos_conf_dir }}/waf/certs/privkey.pem"
+    mode: "0640"
+  when: _tls_key.stat.exists
+
+# Half-pair visibility: the generation gate keys on fullchain and the
+# no-cert warning on the same stat, so "fullchain present, privkey missing"
+# (a botched scp of an operator pair) previously produced no generation, no
+# warning, and a WAF that cannot start. play's tlsops refuses half-pairs
+# hard; surface the same condition at provisioning time.
+- name: Warn on a half-placed TLS pair (exactly one of fullchain/privkey present)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: exactly one of {{ carlos_conf_dir }}/waf/certs/
+      {fullchain,privkey}.pem exists — this looks like a half-placed
+      operator certificate; the WAF cannot start on it and `carlos-ctl play`
+      will refuse. Restore the missing half, or delete the present one to
+      let selfsigned mode regenerate a complete pair.
+  when: _tls_cert.stat.exists != _tls_key.stat.exists
+
+# --- ownership hand-over (subuid-aware — see the bash sweep's rationale) -----------------------
+- name: Hand pod-mounted paths to the service user (subuid-aware sweep)
+  # Entries already owned by the service user OR by a uid inside its subuid
+  # range are LEFT ALONE: post-play the data trees are subuid-owned, and a
+  # blanket re-chown would strip a RUNNING pod's access to its own files
+  # mid-flight (MariaDB binlog rotation fails within minutes).
+  # Per-dir failure TRACKING (not `|| true`-and-forget): a dir the sweep
+  # could not hand over is a pod that cannot read its own config/data — the
+  # task stays non-fatal (a transient chown error on one live tree must not
+  # abort provisioning) but every failed/skipped dir is echoed and surfaced
+  # by the warn task below instead of vanishing into a swallowed rc.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    suid="{{ carlos_service_uid }}"
+    read -r sub_start sub_count < <(awk -F: -v u="{{ carlos_service_user }}" -v uid="$suid" \
+        '$1 == u || $1 == uid { print $2, $3; exit }' /etc/subuid 2>/dev/null) || true
+    fail=""
+    for d in {{ _sweep_dirs | map('quote') | join(' ') }}; do
+        [ -e "$d" ] || continue
+        if [ -n "${sub_start:-}" ] && [ -n "${sub_count:-}" ]; then
+            find "$d" ! -uid "$suid" \
+                 \( -uid -"$sub_start" -o -uid +"$((sub_start + sub_count - 1))" \) \
+                 -exec chown -h "{{ carlos_service_user }}:{{ carlos_service_user }}" {} + \
+                 || fail="$fail $d"
+        elif [ -z "$(find "$d" -mindepth 1 ! -uid 0 ! -uid "$suid" -print -quit 2>/dev/null)" ]; then
+            chown -R "{{ carlos_service_user }}:{{ carlos_service_user }}" "$d" || fail="$fail $d"
+        else
+            echo "SKIP $d (third-uid entries, subuid range unknown)" >&2
+            fail="$fail $d"
+        fi
+    done
+    [ -z "$fail" ] || echo "SWEEP-INCOMPLETE:$fail"
+  args:
+    executable: /bin/bash
+  register: _sweep
+  vars:
+    _sweep_dirs:
+      - "{{ carlos_conf_dir }}/tomcat"
+      - "{{ carlos_conf_dir }}/carlos"
+      - "{{ carlos_conf_dir }}/drugref"
+      - "{{ carlos_conf_dir }}/mariadb"
+      - "{{ carlos_conf_dir }}/vector"
+      - "{{ carlos_conf_dir }}/caddy"
+      - "{{ carlos_conf_dir }}/vmagent"
+      - "{{ carlos_conf_dir }}/vmalert"
+      - "{{ carlos_conf_dir }}/metrics"
+      - "{{ carlos_conf_dir }}/waf"
+      - "{{ carlos_conf_dir }}/restic"
+      - "{{ carlos_data_dir }}/mariadb-mnt"
+      - "{{ carlos_data_dir }}/mariadb-binlog"
+      - "{{ carlos_data_dir }}/OscarDocument"
+      - "{{ carlos_emr_home }}/logs/carlos"
+      - "{{ carlos_emr_home }}/logs/victoria-logs-data"
+      - "{{ carlos_emr_home }}/logs/vector-collector-data"
+      - "{{ carlos_emr_home }}/metrics/victoria-metrics-data"
+      - "{{ carlos_emr_home }}/metrics/vmagent-buffer"
+      - "{{ carlos_emr_home }}/backup/restic-repo"
+      - "{{ carlos_emr_home }}/backup/restic-cache"
+      - "{{ carlos_emr_home }}/backup/mariadb-hot"
+      - "{{ carlos_db_socket_dir }}"
+  changed_when: false
+
+- name: Warn when the ownership sweep could not hand over every path
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: the subuid-aware ownership sweep failed or skipped some paths
+      ({{ _sweep.stdout_lines | select('search', '^SWEEP-INCOMPLETE:') | first
+          | default('') | regex_replace('^SWEEP-INCOMPLETE:', '') }}) — the
+      rootless pod may be unable to read/write them; inspect ownership by
+      hand (see the task's stderr for the per-dir chown/find errors).
+  when: "'SWEEP-INCOMPLETE:' in (_sweep.stdout | default(''))"
+
+- name: Re-pin conf/secrets to root (a service-user-writable bundle is a
+        re-encryption-recipient injection vector)
+  # NO failed_when:false — this is a SECURITY re-pin; a silently-swallowed
+  # failure would leave the secrets bundle service-user-writable (the exact
+  # injection vector the task closes). Fail loudly so it is fixed.
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: root
+    group: root
+  loop:
+    - "{{ carlos_secrets_dir }}"
+  # In --check on a FRESH host the dir was never actually created above, so
+  # the ownership pin has nothing to act on — tolerate check mode only; a
+  # real run still fails loudly (see the security comment above).
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: Map the exporter cnf to the exporter uid inside the userns
+  # The mysqld-exporter reads its 0600 cnf as container uid 65534; a host
+  # chown cannot map that under rootless — run it INSIDE the userns.
+  # `<user>:<user>`, never a bare `<user>`: coreutils chown with no group
+  # leaves the group as root on a root-rendered file, and host gid 0 is NOT
+  # in the service user's userns id_map — chown(2) then refuses the file
+  # outright and the unshare chown below EPERMs (verified live: carlos:root
+  # -> EPERM, carlos:carlos -> ok).
+  ansible.builtin.shell: |
+    chown "{{ carlos_service_user }}:{{ carlos_service_user }}" "{{ carlos_conf_dir }}/metrics/exporter.my.cnf" 2>/dev/null || true
+    runuser -u {{ carlos_service_user }} -- env \
+      XDG_RUNTIME_DIR=/run/user/{{ carlos_service_uid }} \
+      podman unshare chown 65534:65534 "{{ carlos_conf_dir }}/metrics/exporter.my.cnf"
+  when: carlos_obs_enabled | bool
+  register: _exp_chown
+  # Non-fatal (metrics-only, not security/data) but VISIBLE: a swallowed
+  # failure means mysqld metrics silently never appear. The following task
+  # surfaces it instead of the old bare failed_when:false.
+  failed_when: false
+  # changed_when:false — this is an idempotent ownership convergence (chown to
+  # a fixed uid); a plain shell task would otherwise report 'changed' on EVERY
+  # run, defeating the "re-run the playbook forever" idempotency contract.
+  # (A duplicate `changed_when: _exp_chown.rc == 0` key used to sit below this
+  # one — YAML keeps the LAST duplicate, so the task reported changed on every
+  # successful run, silently inverting exactly what this comment promises.)
+  changed_when: false
+
+- name: Warn when the exporter cnf userns map failed (mysqld metrics will be missing)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: could not map {{ carlos_conf_dir }}/metrics/exporter.my.cnf to
+      the exporter uid inside the userns — mysqld-exporter cannot read it, so
+      MariaDB metrics will be missing until this is fixed and 'carlos-ctl play'
+      re-runs.
+  when: carlos_obs_enabled | bool and _exp_chown.rc | default(0) != 0
+
+- name: Map the Caddyfile to the logview uid inside the userns
+  # Same problem class as the exporter cnf, one container over: the logview
+  # caddy runs as container uid 10013 with drop-ALL (no DAC_OVERRIDE) and
+  # reads the 0600 Caddyfile — a host-side root/service-user owner maps to
+  # container root (or nobody), so caddy EACCESes at config load and the PHI
+  # log view crash-loops. Every live test before this fix fabricated the
+  # Caddyfile 0644 (dev flow, hermetic suite), which is readable by any uid;
+  # only the Ansible render is 0600 — hence five passes missing it.
+  # `<user>:<user>` — see the exporter task's group-ownership rationale.
+  ansible.builtin.shell: |
+    chown "{{ carlos_service_user }}:{{ carlos_service_user }}" "{{ carlos_conf_dir }}/caddy/Caddyfile" 2>/dev/null || true
+    runuser -u {{ carlos_service_user }} -- env \
+      XDG_RUNTIME_DIR=/run/user/{{ carlos_service_uid }} \
+      podman unshare chown 10013:10013 "{{ carlos_conf_dir }}/caddy/Caddyfile"
+  when: carlos_obs_enabled | bool
+  register: _caddy_chown
+  failed_when: false
+  # Idempotent ownership convergence — see the exporter task's rationale.
+  changed_when: false
+
+- name: Warn when the Caddyfile userns map failed (log view will crash-loop)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: could not map {{ carlos_conf_dir }}/caddy/Caddyfile to the
+      logview uid inside the userns — caddy (uid 10013) cannot read its 0600
+      config, so the authenticated log view will crash-loop until this is
+      fixed and 'carlos-ctl play' re-runs.
+  when: carlos_obs_enabled | bool and _caddy_chown.rc | default(0) != 0

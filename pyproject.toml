@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# carlos-ctl — host runtime CLI for the CARLOS EMR podman deployment.
+#
+# Packaging note: production hosts install this WITHOUT pip/PyPI — the Ansible
+# role copies the carlos_ctl package into /usr/local/lib/carlos-ctl and drops a
+# /usr/local/sbin/carlos-ctl shim; runtime deps (PyYAML, bcrypt) come from
+# distro packages (python3-yaml, python3-bcrypt). This file exists for the dev
+# toolchain (ruff/mypy/pytest) and for editable installs on a workstation.
+[project]
+name = "carlos-ctl"
+version = "2.0.0"
+description = "CARLOS EMR podman deployment: host runtime CLI (lifecycle, secrets, backup, monitoring)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-only" }
+dependencies = [
+    "PyYAML>=5.4",
+    "bcrypt>=3.2",
+]
+
+[project.scripts]
+carlos-ctl = "carlos_ctl.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["carlos_ctl"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "S"]
+ignore = [
+    # subprocess use is this tool's entire job; every call site uses list argv
+    # (never shell=True) — see carlos_ctl.runner.
+    "S603", "S607",
+    # Python 3.9 compatibility: typing.Dict/Optional/Union stay (EL9 baseline);
+    # ruff's pyupgrade would rewrite them to 3.10+ syntax.
+    "UP006", "UP007", "UP035", "UP045",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S104", "S105", "S106", "S108"]
+# Digest-pinned image references (repo:tag@sha256:...) cannot wrap.
+"carlos_ctl/config.py" = ["E501"]
+# Wizard NEXT-STEPS text prints copy-pasteable commands that must not wrap.
+"carlos_ctl/setup.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+# This code does heavy string comparison of normalized timestamps, anchors,
+# and env values; strict_equality catches a str-vs-bytes or non-overlapping
+# compare that would silently evaluate constant-false and skip a guard.
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = ["bcrypt", "yaml"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+pythonpath = ["."]

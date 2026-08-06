@@ -1,0 +1,17 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for ss — the play port-in-use preflight runs `ss -tlnH sport = :N`.
+# Default: nothing is bound (empty output). STUB_PORT_BOUND=<port> reports that
+# one port as LISTENing so the preflight's foreign-listener refusal can be
+# exercised hermetically (real ss would query the host).
+echo "ss $*" >> "${STUBLOG:-/dev/null}"
+if [[ -n "${STUB_PORT_BOUND:-}" ]]; then
+    for a in "$@"; do
+        if [[ "$a" == *":$STUB_PORT_BOUND"* ]]; then
+            echo "LISTEN 0 128 0.0.0.0:$STUB_PORT_BOUND 0.0.0.0:*"
+            exit 0
+        fi
+    done
+fi
+exit 0

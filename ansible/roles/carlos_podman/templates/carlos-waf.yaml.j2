@@ -1,0 +1,319 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Rendered by the carlos_podman Ansible role — do not edit; change host_vars and re-run ansible-playbook.
+# carlos-waf pod — the internet-facing ModSecurity/CRS edge, in its OWN pod so
+# a WAF-container compromise shares no network namespace with MariaDB or the
+# app Tomcats. Rendered by the carlos_podman Ansible role (host_vars values) to
+# $EMR_HOME/container/{{ carlos_waf_pod }}.yaml for `podman kube play`.
+#
+# It joins ONLY the {{ carlos_edge_net_name }} network — deliberately NOT {{ carlos_net_name }},
+# which would give this internet-facing container a path to the obs pod's
+# unauthenticated VictoriaLogs/VictoriaMetrics HTTP APIs (PHI logs) — and
+# proxies to the app pod by pod-name DNS:
+#
+#   waf ({{ carlos_https_port }} on {{ carlos_bind_ip }}) --{{ carlos_edge_net_name }}, TLS--> {{ carlos_app_pod }}:8443
+#
+# MariaDB binds in-pod loopback (zz-carlos.cnf bind_address), so {{ carlos_app_pod }}:3306
+# is NOT reachable from here even over the shared edge network —
+# `carlos-ctl check` asserts all three directions (8443 reachable, 8080
+# plaintext closed, 3306 not reachable).
+#
+# Runs with podman's journald log driver like the app pod; the obs pod's
+# logcollect splits this container's output into the waf-access / waf-error
+# streams by journal priority, exactly as before the move.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ carlos_waf_pod }}
+  labels:
+    app: {{ carlos_waf_pod }}
+  # See carlos-app.yaml.j2 for why pids caps are pod annotations.
+  annotations:
+    io.podman.annotations.pids-limit/waf: "2048"
+spec:
+  # Explicit (the unset default is Always): a container that crash-loops under
+  # Always is restarted by podman forever while the pod's systemd unit stays
+  # 'active' — invisible to the unit-level signal. OnFailure keeps legitimate
+  # failure restarts but lets a terminally-broken container surface instead of
+  # masking it; the monitor's 15-min per-container sweep is the detector.
+  restartPolicy: OnFailure
+  initContainers:
+    # Stage the TLS cert+key into a tmpfs emptyDir the waf container can read.
+    # The host certs dir is 0700 (owned by the service user under the rootless
+    # engine), so its OWN mode applies inside a container and the unprivileged
+    # `nginx` user cannot traverse a direct bind mount — copy the PEMs out
+    # instead. runAsUser 0 == the service user on the host, which OWNS both
+    # /certs-src (0700) and the /certs-out emptyDir. The PRIVATE key is staged
+    # 0640 owned by the listener's uid, never 0644: a world-readable-mode PHI
+    # TLS key fails audits even inside a pod-private tmpfs. The uid is
+    # RESOLVED from this image's own /etc/passwd (waf-init runs WAF_IMAGE
+    # itself — the db-init "no hardcoded uid" pattern): `nginx` for the CRS
+    # nginx variant, `www-data` for a still-pinned Apache variant, and a
+    # 0644-with-warning fallback for an image with neither (uid-agnostic, the
+    # pre-hardening behavior) so an image bump can never take the front door
+    # down over a stale uid pin. CHOWN is the one capability added back; the
+    # cert stays 0644 (public material).
+    - name: waf-init
+      image: "{{ carlos_waf_image }}"
+      # chmod BEFORE chown (same rule as tls-init in the app pod): with
+      # drop ALL + add CHOWN, a root chmod on a file already chowned away
+      # EPERMs (no CAP_FOWNER) and set -e would kill the init.
+      command: ["bash", "-c", "set -e; umask 022; cp /certs-src/fullchain.pem /certs-src/privkey.pem /certs-out/; chmod 0644 /certs-out/fullchain.pem; u=\"$(id -u nginx 2>/dev/null || id -u www-data 2>/dev/null || true)\"; if [ -n \"$u\" ]; then chmod 0640 /certs-out/privkey.pem; chown \"$u:$u\" /certs-out/privkey.pem; else echo 'waf-init: no nginx/www-data user in this image — staging the key 0644 (readable only inside this pod-private tmpfs)' >&2; chmod 0644 /certs-out/privkey.pem; fi"]
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+          add: ["CHOWN"]
+      resources:
+        limits:
+          memory: "256Mi"
+          cpu: "1"
+      volumeMounts:
+        - name: waf-certs
+          mountPath: /certs-src
+          readOnly: true
+        - name: waf-certs-runtime
+          mountPath: /certs-out
+  containers:
+    # WAF_IMAGE defaults (in carlos-ctl) to a dated build of the CRS 4.25 LTS
+    # line, NGINX variant (ModSecurity v3) — the image family upstream builds
+    # read-only-rootfs support for. When bumping, mind the env-var contract
+    # (SSL_CERT_FILE / SSL_CERT_KEY_FILE, PORT / SSL_PORT, the CRS v4 names
+    # below, the NGINX_* proxy-header vars); check the release notes of
+    # github.com/coreruleset/modsecurity-crs-docker before changing.
+    #
+    # READ-ONLY ROOT (deferred, upstream-blocked): upstream documents
+    # *-nginx-read-only variants but publishes none yet (the bake-matrix
+    # entry is disabled as of 2026-07). RO is NOT a runtime flag on the plain
+    # image — the entrypoint envsubsts config into /etc/nginx at startup, and
+    # the read-only design needs an image BUILT with READ_ONLY_FS=true
+    # (writables staged to /usr/local/bootstrap, restored into tmpfs at
+    # start). When the read-only tags ship: repin WAF_IMAGE, add
+    # readOnlyRootFilesystem: true here, and add emptyDir mounts at
+    # /etc/nginx, /etc/modsecurity.d, and /opt/owasp-crs per upstream's docs.
+    #
+    # STARTUP DEPENDENCY: nginx resolves the static proxy_pass BACKEND
+    # hostname once at startup, caches it, and EXITS if it does not resolve —
+    # the quadlet orders this pod after the app pod and Restart=on-failure
+    # covers the races (the old Apache variant instead started and 503'd).
+    - name: waf
+      image: "{{ carlos_waf_image }}"
+      resources:
+        limits:
+          memory: "{{ carlos_waf_mem_limit }}"
+          cpu: "{{ carlos_waf_cpu_limit }}"
+      # Runs NON-ROOT: the CRS nginx images run entirely as the image's own
+      # unprivileged `nginx` user (USER directive; that is also why the
+      # listeners are 18000/18080 — an unprivileged process cannot bind
+      # <1024), so ALL capabilities are dropped with no add-backs. The nginx
+      # uid is image-assigned, deliberately NOT pinned here with
+      # runAsUser/runAsNonRoot — named-user verification is unreliable and a
+      # wrong pin would break the image's own chowned dirs; `carlos-ctl
+      # check` asserts no root process at runtime instead. The TLS cert+key
+      # are read from the waf-certs-runtime tmpfs emptyDir that waf-init
+      # stages them into at 0644 (see initContainers above).
+      securityContext:
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      # Detect a hung/dead front door and restart it. Probe the PLAIN
+      # internal listener (PORT 18000), not the TLS port (18080): a bash
+      # /dev/tcp open finishes the TCP handshake then closes mid-TLS, which
+      # would log an SSL handshake error into the shipped WAF error stream
+      # every cycle. (The debian-based nginx CRS image ships bash.)
+      livenessProbe:
+        exec:
+          command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/18000"]
+        initialDelaySeconds: 20
+        periodSeconds: 30
+        timeoutSeconds: 10
+        failureThreshold: 5
+      # Publishes HTTPS_PUBLISH_PORT (>1024, bindable by the rootless engine);
+      # the root nftables redirect sends BIND_IP:HTTPS_PORT (443) here.
+      ports:
+        - containerPort: 18080
+          hostPort: {{ carlos_https_publish_port }}
+          hostIP: "{{ carlos_bind_ip }}"
+      env:
+        - name: PORT
+          value: "18000"
+        - name: SSL_PORT
+          value: "18080"
+        - name: SSL_CERT_FILE
+          value: "/etc/ssl/private/fullchain.pem"
+        - name: SSL_CERT_KEY_FILE
+          value: "/etc/ssl/private/privkey.pem"
+        - name: SSL_OCSP_STAPLING
+          value: "off"
+        # The app pod by pod-name DNS over {{ carlos_edge_net_name }} (aardvark-dns). If
+        # your podman's aardvark registers container names rather than pod
+        # names, point this at https://{{ carlos_app_pod }}-carlos:8443 instead —
+        # `carlos-ctl check` detects and names this exact failure.
+        # TLS TO THE BACKEND: Tomcat's 8443 connector serves a self-signed
+        # per-pod-start cert (tls-init in carlos-app.yaml.j2), so the
+        # cross-pod edge-network hop carries no plaintext PHI. The plaintext
+        # 8080 connector is loopback-pinned and NOT reachable from here.
+        - name: BACKEND
+          value: "https://{{ carlos_app_pod }}:8443"
+        # PROXY_SSL=on makes the image include its proxy_backend_ssl.conf
+        # (proxy_ssl_* directives). PROXY_SSL_CERT/_KEY are the nginx CLIENT
+        # cert slots the template interpolates — they MUST be set to real,
+        # readable PEM files or nginx fails at config load (the image's ENV
+        # defaults use different names and point at files that do not exist).
+        # Tomcat never requests a client cert, so reusing the front-door pair
+        # staged by waf-init is safe and guaranteed present.
+        # RESIDUAL (documented): PROXY_SSL_VERIFY stays off — the backend
+        # cert is self-signed and regenerated each pod start, and the image
+        # template has no trusted-CA hook; upstream AUTHENTICATION remains
+        # the edge network's membership boundary (unchanged). This hop
+        # upgrade is confidentiality, not upstream authn.
+        - name: PROXY_SSL
+          value: "on"
+        - name: PROXY_SSL_CERT
+          value: "/etc/ssl/private/fullchain.pem"
+        - name: PROXY_SSL_CERT_KEY
+          value: "/etc/ssl/private/privkey.pem"
+        - name: PROXY_SSL_VERIFY
+          value: "off"
+        # nginx syntax: an explicit TLS version list ("TLSv1.2 TLSv1.3"), NOT
+        # the Apache-era "all -SSLv3 ..." form (cmd_render warns on that shape).
+        - name: SSL_PROTOCOLS
+          value: "{{ carlos_waf_ssl_protocols }}"
+        # Pin the TLSv1.2 cipher suite (Mozilla intermediate, ECDHE-only) so
+        # an image bump can never silently weaken PHI-in-transit. TLSv1.3
+        # suites are governed separately by nginx and unaffected. Verify the
+        # CRS image still consumes SSL_CIPHERS on major image bumps.
+        - name: SSL_CIPHERS
+          value: "{{ carlos_waf_ssl_ciphers }}"
+        # Pin explicitly (same rationale as SSL_CIPHERS): the CRS image's
+        # default.conf.template renders `server_tokens ${SERVER_TOKENS}` and
+        # nginx-headers.conf deliberately carries no server_tokens directive
+        # (a duplicate hard-fails nginx — verified live). Without this pin
+        # the version-banner suppression rides on the image's OWN env
+        # default, which a future image bump could change silently.
+        - name: SERVER_TOKENS
+          value: "off"
+        - name: SERVER_NAME
+          value: "{{ carlos_server_name }}"
+        # Advertise the user-facing front-door port, not the internal 18080:
+        # the proxy template sends X-Forwarded-Port to Tomcat, and the default
+        # ($server_port) would leak the internal listener port into redirects
+        # that inspect it. X-Forwarded-For/-Proto are sent by the template
+        # unconditionally — the RemoteIpValve login chain depends on -Proto.
+        - name: NGINX_X_FORWARDED_PORT
+          value: "{{ carlos_https_port }}"
+        # Match Tomcat's maxPostSize (conf/tomcat/server.xml, 50 MB document
+        # and lab uploads): the image default SecRequestBodyLimit is 12.5 MB
+        # with MODSEC_REQ_BODY_LIMIT_ACTION=Reject, which would 413 large
+        # uploads at the edge before Tomcat ever sees them. (nginx's own
+        # client_max_body_size is 0/unlimited in the image template.)
+        - name: MODSEC_REQ_BODY_LIMIT
+          value: "52428800"
+        # Log to container stdout/stderr -> host journald -> logcollect. The
+        # collector splits this container's stream by journal PRIORITY into
+        # waf-access (stdout) and waf-error (stderr). The full ModSecurity audit
+        # log also stays on stdout (podman logs {{ carlos_waf_pod }}-waf).
+        # PHI NOTE: audit records are BODY-FREE by default (see
+        # MODSEC_AUDIT_LOG_PARTS below). The access log's request line still
+        # carries the query string, which can hold PHI-correlating identifiers
+        # (demographic_no, billing ids) — these are NUMERIC in CARLOS, so the
+        # logcollect `redact` transform masks them on every waf-* stream BEFORE
+        # they reach VictoriaLogs (journald-collector.toml.j2). Residuals: the
+        # pre-collector copy in the host journal is unredacted, and any
+        # non-numeric identifier is not masked. The VictoriaLogs stream sits
+        # behind the basic_auth/TLS log-view gate at LOG_RETENTION (default
+        # 180d). Retention and access remain a conscious compliance decision
+        # (HIPAA/PIPEDA); see README "WAF audit log & PHI". Operators needing
+        # the query string dropped entirely must define a custom nginx
+        # log_format ($uri, not $request) — an image-server-level change, so
+        # validate a live `curl` before relying on it.
+        - name: ACCESSLOG
+          value: "/dev/stdout"
+        - name: ERRORLOG
+          value: "/dev/stderr"
+        - name: LOGLEVEL
+          value: warn
+        # CRS v4 image variable names (v3-era PARANOIA/ANOMALYIN/ANOMALYOUT are
+        # NOT read by this image). Tunable via carlos-app.env.
+        - name: BLOCKING_PARANOIA
+          value: "{{ carlos_waf_paranoia }}"
+        - name: ANOMALY_INBOUND
+          value: "{{ carlos_waf_anomaly_inbound }}"
+        - name: ANOMALY_OUTBOUND
+          value: "{{ carlos_waf_anomaly_outbound }}"
+        # CRS rule 920440 matches each extension "/"-terminated. Extensions the
+        # CARLOS UI legitimately serves (.jsp .js .css .html .htm .xml) must NOT
+        # be listed here — restricting them blocks the whole application.
+        # Setting this variable REPLACES the CRS default list, so the CRS
+        # defaults that don't collide with the UI (.bak .sql .key .log ...)
+        # are re-appended explicitly — dropping them silently made backup
+        # dumps, key files and logs fetchable through the WAF.
+        - name: RESTRICTED_EXTENSIONS
+          value: ".jspf/ .java/ .class/ .jar/ .war/ .conf/ .properties/ .ini/ .php/ .asp/ .asmx/ .exe/ .dll/ .sh/ .bat/ .cmd/ .ps1/ .py/ .rb/ .pl/ .c/ .cpp/ .bak/ .backup/ .old/ .sql/ .db/ .key/ .pass/ .pwd/ .config/ .inc/ .swp/ .log/ .cer/ .cfg/ .cs/ .dbf/ .htr/ .mdb/ .sys/ .vb/ .vbs/"
+        # Pin the rule/audit engine explicitly so BLOCKING is contractual, not
+        # dependent on the CRS image default (a future image bump could silently
+        # ship DetectionOnly). RelevantOnly + /dev/stdout matches the README's
+        # journald-shipped audit behavior.
+        - name: MODSEC_RULE_ENGINE
+          value: "On"
+        - name: MODSEC_AUDIT_ENGINE
+          value: "RelevantOnly"
+        - name: MODSEC_AUDIT_LOG
+          value: "/dev/stdout"
+        # BODY-FREE audit records by default: parts C/E (request/response
+        # bodies) and I/J (reduced body / uploaded-file info) are where PHI
+        # lands — clinical free-text, health-card numbers — on every CRS
+        # false positive, and this stream persists for LOG_RETENTION plus
+        # the host journal. ABFHKZ keeps headers + matched rules (enough to
+        # triage). Restoring full capture is a conscious PHI decision:
+        # WAF_AUDIT_LOG_PARTS=ABCEFHIJKZ in carlos-app.env (see README).
+        - name: MODSEC_AUDIT_LOG_PARTS
+          value: "{{ carlos_waf_audit_log_parts }}"
+      # NO /etc/resolv.conf mount here (unlike the carlos container): podman's
+      # generated resolv.conf carries the aardvark-dns server, which is what
+      # resolves {{ carlos_app_pod }} — overriding it with a host copy would break every
+      # proxied request. The WAF needs no external DNS (OCSP stapling off, no
+      # outbound integrations; the resolv.conf workaround exists for CARLOS's
+      # Teleplan/HRM/MCEDT).
+      volumeMounts:
+        - name: waf-certs-runtime
+          mountPath: /etc/ssl/private
+          readOnly: true
+        # The nginx image keeps the CRS tree at /opt/owasp-crs (and symlinks
+        # /etc/modsecurity.d/owasp-crs -> /opt/owasp-crs) — mount the site
+        # exclusions at the real path, not through the symlink.
+        - name: waf-conf
+          mountPath: /opt/owasp-crs/rules/RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf
+          subPath: RESPONSE-999-EXCLUSION-RULES-AFTER-CRS.conf
+          readOnly: true
+        # Security response headers (HSTS, nosniff, SAMEORIGIN, Referrer-Policy)
+        # for the app front door — included at nginx http level. See
+        # conf/waf/nginx-headers.conf for the add_header-inheritance caveat.
+        - name: waf-conf
+          mountPath: /etc/nginx/conf.d/nginx-headers.conf
+          subPath: nginx-headers.conf
+          readOnly: true
+
+  volumes:
+    # --- read-only configuration, installed by the Ansible role
+    #     (type Directory: fail fast if init has not run) ---
+    - name: waf-conf
+      hostPath:
+        path: {{ carlos_emr_home }}/container/conf/waf
+        type: Directory
+    # Source of the TLS PEMs (0700 dir); read only by waf-init, which stages
+    # them into the runtime emptyDir below.
+    - name: waf-certs
+      hostPath:
+        path: {{ carlos_emr_home }}/container/conf/waf/certs
+        type: Directory
+    # Staged cert+key (tmpfs) the waf container reads — waf-init populates it.
+    - name: waf-certs-runtime
+      emptyDir:
+        medium: Memory

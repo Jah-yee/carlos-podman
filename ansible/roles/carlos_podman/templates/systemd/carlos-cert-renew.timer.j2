@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Installed by the carlos-podman Ansible role to /etc/systemd/system/
+# (acme TLS mode only).
+[Unit]
+Description=CARLOS EMR daily TLS renewal check (certbot, acme mode)
+# Only after go-live: before the first play there is no front door for
+# HTTP-01 to matter, and a failing renewal would page against a stack that
+# is not serving yet (first issuance is the documented pre-play runbook step).
+ConditionPathExists={{ carlos_emr_home }}/container/.deployed
+
+[Timer]
+OnCalendar=daily
+# Wide jitter: Let's Encrypt asks clients to spread renewal load, and a
+# missed instant is irrelevant at a 30-day renewal margin.
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

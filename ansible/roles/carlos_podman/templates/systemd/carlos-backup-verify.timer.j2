@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Installed by the carlos-podman Ansible role to /etc/systemd/system/.
+[Unit]
+Description=Weekly CARLOS EMR backup restore drill
+# Fire only after the first successful `carlos-ctl play` created the go-live
+# marker: the playbook enables these timers without starting them (they would
+# fail — and page — against a down stack), and without this gate a REBOOT in
+# the provision->first-play window (image builds and TLS certs routinely take
+# days) would start them anyway and resurrect the failure storm.
+ConditionPathExists={{ carlos_emr_home }}/container/.deployed
+
+[Timer]
+OnCalendar={{ carlos_backup_verify_oncalendar }}
+Persistent=true
+# jitter so weekly drills across instances/hosts do not synchronize.
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

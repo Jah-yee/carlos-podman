@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# carlos-podman instance registry — written by the carlos_podman Ansible role.
+# Do not edit. Runtime metadata only: carlos-ctl reads it for --instance
+# resolution and `instances`; collision CHECKING happens in the playbook.
+INSTANCE={{ carlos_instance }}
+EMR_HOME={{ carlos_emr_home }}
+SERVICE_USER={{ carlos_service_user }}
+BIND_IP={{ carlos_bind_ip }}
+HTTPS_PORT={{ carlos_https_port }}
+HTTPS_PUBLISH_PORT={{ carlos_https_publish_port }}
+LOG_VIEW_PORT={{ carlos_log_view_port }}
+VICTORIALOGS_PORT={{ carlos_victorialogs_port }}
+VICTORIAMETRICS_PORT={{ carlos_victoriametrics_port }}
+VMALERT_PORT={{ carlos_vmalert_port }}
+PMA_PORT={{ carlos_pma_port }}

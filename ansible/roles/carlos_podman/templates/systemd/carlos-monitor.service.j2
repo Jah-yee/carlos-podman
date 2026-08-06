@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Installed by the carlos-podman Ansible role to /etc/systemd/system/.
+# No OnFailure= here: `carlos-ctl monitor` dispatches a specific alert per problem
+# itself, so relying on OnFailure too would double-alert. A nonzero exit just
+# marks the run failed for `systemctl status` visibility.
+[Unit]
+Description=CARLOS EMR health monitor (disk + TLS cert expiry)
+
+[Service]
+Type=oneshot
+# Type=oneshot defaults TimeoutStartSec to INFINITY: a hung sweep (wedged
+# podman inspect, blocking curl) would sit forever and stop every LATER sweep
+# from firing — the watchdog must never be the thing that hangs. OnFailure
+# only covers runs that EXIT.
+TimeoutStartSec=15min
+# carlos-ctl reads the instance home from $EMR_HOME.
+Environment=EMR_HOME={{ carlos_emr_home }}
+ExecStart=/usr/local/sbin/carlos-ctl monitor
+Nice=10
+
+# Hardening for a runuser + rootless-podman ROOT oneshot. The heavy
+# confinement the guard/nft oneshots carry is UNSAFE here and deliberately
+# omitted: NoNewPrivileges / RestrictSUIDSGID break runuser's setuid
+# transition into the service user; ProtectHome hides the service user's
+# HOME and /run/user, where rootless podman keeps its container storage and
+# runtime socket; ProtectControlGroups breaks podman's cgroup delegation.
+# These directives isolate /tmp and the kernel surface without touching any
+# of that.
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictRealtime=yes
+LockPersonality=yes

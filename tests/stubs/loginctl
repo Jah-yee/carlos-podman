@@ -1,0 +1,6 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for loginctl — records the invocation, succeeds.
+echo "loginctl $*" >> "${STUBLOG:-/dev/null}"
+exit 0
