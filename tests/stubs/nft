@@ -1,0 +1,8 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for nft — records the invocation, succeeds. STUB_NFT_FAIL=1 makes an
+# `nft -f` apply fail (exercises the fail-closed log-view drop-gate path).
+echo "nft $*" >> "${STUBLOG:-/dev/null}"
+if [[ -n "${STUB_NFT_FAIL:-}" && " $* " == *" -f "* ]]; then exit 1; fi
+exit 0

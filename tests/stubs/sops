@@ -1,0 +1,79 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for sops. Models an encrypted file as the base64 of its PLAINTEXT
+# (two-level YAML for the secrets bundle) inside a SOPS_ENC[...] envelope, so
+# a grep for a raw secret value FAILS (values are base64-encoded at rest)
+# while -d / -e / `-d --extract` are deterministic. This is NOT real crypto —
+# it exists so the hermetic suite can drive the single-master secrets flow
+# without sops/age installed. carlos-ctl edits the bundle via a full
+# decrypt -> awk upsert -> re-encrypt round-trip (never `sops --set`, which
+# would put the secret on the argv), so this stub models exactly -e/-d.
+#   STUB_SOPS_DECRYPT_FAIL=1   every decrypt exits 1 (lost/wrong age key)
+log="${STUBLOG:-/dev/null}"
+echo "sops $*" >> "$log"
+[[ -n "${SOPS_AGE_KEY_FILE:-}" ]]   && echo "sops-env SOPS_AGE_KEY_FILE=$SOPS_AGE_KEY_FILE" >> "$log"
+[[ -n "${SOPS_AGE_RECIPIENTS:-}" ]] && echo "sops-env SOPS_AGE_RECIPIENTS=$SOPS_AGE_RECIPIENTS" >> "$log"
+
+enc=0 dec=0 inplace=0 extract="" file=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -e|--encrypt)  enc=1 ;;
+    -d|--decrypt)  dec=1 ;;
+    -i|--in-place) inplace=1 ;;
+    --extract)     extract="$2"; shift ;;
+    --)            ;;
+    -*)            ;;                # ignore other flags
+    *)             file="$1" ;;
+  esac
+  shift
+done
+
+read_plain() {   # decode the SOPS_ENC[...] envelope back to the plaintext
+  [[ -f "$file" ]] || return 1
+  sed -n '/^SOPS_ENC\[$/,/^\]$/{ /^SOPS_ENC\[$/d; /^\]$/d; p }' "$file" | base64 -d
+}
+write_enc() {    # stdin plaintext -> wrapped envelope on stdout
+  local b64; b64="$(base64 -w0)"
+  printf 'SOPS_ENC[\n%s\n]\n' "$b64"
+}
+# Decode a JSON-string scalar (the format carlos-ctl writes values in).
+json_decode() {
+  local v="$1"
+  v="${v#\"}"; v="${v%\"}"
+  v="${v//\\\"/\"}"; v="${v//\\n/$'\n'}"; v="${v//\\t/$'\t'}"; v="${v//\\r/$'\r'}"; v="${v//\\\\/\\}"
+  printf '%s' "$v"
+}
+
+if [[ "$dec" == 1 ]]; then
+  [[ -n "${STUB_SOPS_DECRYPT_FAIL:-}" ]] && exit 1
+  plain="$(read_plain)" || exit 1
+  if [[ -n "$extract" ]]; then
+    # Real YAML parse (PyYAML ships in the dev/CI env): the Python CLI writes
+    # the decrypted bundle via yaml.safe_dump, whose quoting/block-scalar
+    # choices a line-oriented awk cannot reliably read.
+    printf '%s' "$plain" | EXTRACT="$extract" python3 -c '
+import os, re, sys, yaml
+data = yaml.safe_load(sys.stdin) or {}
+for part in re.findall(r"\[\"([^\"]*)\"\]", os.environ["EXTRACT"]):
+    if not isinstance(data, dict) or part not in data:
+        sys.exit(1)
+    data = data[part]
+sys.stdout.write(data if isinstance(data, str) else str(data))
+'
+    exit $?
+  fi
+  printf '%s\n' "$plain"
+  exit 0
+fi
+if [[ "$enc" == 1 ]]; then
+  if [[ "$inplace" == 1 ]]; then
+    plain="$(cat "$file")"
+    printf '%s\n' "$plain" | write_enc > "$file"
+    chmod 0600 "$file" 2>/dev/null || true
+  else
+    write_enc < "$file"
+  fi
+  exit 0
+fi
+exit 0

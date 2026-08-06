@@ -1,0 +1,21 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for age-keygen — writes a DETERMINISTIC keypair so bundle/recipient
+# assertions are stable. Mirrors the real file format (comment lines + secret).
+echo "age-keygen $*" >> "${STUBLOG:-/dev/null}"
+out="" derive=""
+while [[ $# -gt 0 ]]; do case "$1" in -o) out="$2"; shift ;; -y) derive="$2"; shift ;; esac; shift; done
+pub="age1stubrecipient00000000000000000000000000000000000000000000000"
+# `age-keygen -y <keyfile>` derives + prints the recipient to STDOUT.
+if [[ -n "$derive" ]]; then echo "$pub"; exit 0; fi
+if [[ -n "$out" ]]; then
+  {
+    echo "# created: 2026-01-01T00:00:00Z"
+    echo "# public key: $pub"
+    echo "AGE-SECRET-KEY-1STUBSTUBSTUBSTUBSTUBSTUBSTUBSTUBSTUBSTUBSTUBSTUB00"
+  } > "$out"
+  chmod 0600 "$out" 2>/dev/null || true
+fi
+# Real age-keygen prints the public key to stderr.
+echo "Public key: $pub" >&2

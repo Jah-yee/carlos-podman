@@ -1,0 +1,496 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Rendered by the carlos_podman Ansible role — do not edit; change host_vars and re-run ansible-playbook.
+# carlos-obs pod — observability + admin, split out of the app pod so app
+# deploys/restarts never bounce the log/metric stores. Rendered by the carlos_podman Ansible role
+# (placeholders filled from carlos-app.env) to $EMR_HOME/container/carlos-obs.yaml.
+#
+# Everything binds the HOST loopback (or BIND_IP for the log view):
+#   victorialogs   :9428 (127.0.0.1)  log store + query API
+#   victoria-metrics :8428 (also reachable in-network as {{ carlos_obs_pod }}:8428, where
+#                                      the app-pod vmagent remote-writes)
+#   logcollect     (no port)          Vector: host journald -> victorialogs
+#   logview (caddy) :9443 (BIND_IP)    TLS + basic_auth, read-only routes into
+#                                      BOTH the logs (vmui) and metrics (vmui) UIs
+#
+# Log collection is journald-based: the app pod runs with podman's journald log
+# driver, so every app-pod container's stdout/stderr lands in the host journal;
+# logcollect tails it (checkpointed, disk-buffered) and ships to victorialogs.
+# The obs pod itself keeps the default log driver, so its own containers do not
+# feed the collector.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ carlos_obs_pod }}
+  labels:
+    app: {{ carlos_obs_pod }}
+  annotations:
+    io.podman.annotations.pids-limit/victorialogs: "2048"
+    io.podman.annotations.pids-limit/victoria-metrics: "2048"
+    io.podman.annotations.pids-limit/vmalert: "2048"
+    io.podman.annotations.pids-limit/logcollect: "2048"
+    io.podman.annotations.pids-limit/logview: "2048"
+    io.podman.annotations.pids-limit/node-exporter: "2048"
+spec:
+  # Explicit (the unset default is Always): a crash-looping container under
+  # Always is restarted by podman forever while the pod's systemd unit stays
+  # 'active'. OnFailure keeps failure restarts but lets a terminally-broken
+  # container surface; the monitor's 15-min per-container sweep detects it.
+  restartPolicy: OnFailure
+  initContainers:
+    # Root-only setup so every store/view container below can run NON-ROOT:
+    # guarded chowns of the persistent store dirs and Caddy's writable
+    # emptyDirs (a one-time ownership migration on an existing install, like
+    # the OscarDocument precedent — may take a moment on a large log store),
+    # plus staging the TLS cert+key into a tmpfs the non-root logview reads
+    # (the host certs dir is 0700, so a direct bind mount is untraversable by
+    # uid 10013 — same reason as the waf pod's waf-init). CHOWN is the only
+    # capability used (DAC_OVERRIDE as trim-able safety).
+    - name: obs-init
+      image: "{{ carlos_caddy_image }}"
+      command: ["sh", "-c", "set -e; for spec in /victoria-logs-data:10010 /victoria-metrics-data:10011 /caddy-data:10013 /caddy-config:10013; do d=${spec%:*}; u=${spec#*:}; [ \"$(stat -c %u \"$d\")\" = \"$u\" ] || chown -R \"$u:$u\" \"$d\"; done; cp /certs-src/fullchain.pem /certs-src/privkey.pem /certs-out/; chmod 0640 /certs-out/fullchain.pem /certs-out/privkey.pem; chown 10013:10013 /certs-out/fullchain.pem /certs-out/privkey.pem"]
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        # obs-init writes only to its mounts (chowns the store dirs, copies the
+        # cert PEMs into the tmpfs) — a read-only root is safe here and matches
+        # every other init container (waf-init/db-init/carlos-init/drugref-init).
+        readOnlyRootFilesystem: true
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+          add: ["CHOWN", "DAC_OVERRIDE"]
+      # Bound the (root) init container too — literal limits (short-lived
+      # chown+copy, no per-service tuning knob) matching db-init/waf-init.
+      resources:
+        limits:
+          memory: "256Mi"
+          cpu: "1"
+      volumeMounts:
+        - name: victorialogs-data
+          mountPath: /victoria-logs-data
+        - name: victoria-metrics-data
+          mountPath: /victoria-metrics-data
+        - name: caddy-data
+          mountPath: /caddy-data
+        - name: caddy-config
+          mountPath: /caddy-config
+        - name: waf-certs
+          mountPath: /certs-src
+          readOnly: true
+        - name: logview-certs
+          mountPath: /certs-out
+
+  containers:
+    # Host metrics (CPU/memory/network/load), moved here from the app pod so a
+    # root container no longer sits in the PHI pod. Binds :9100 (not loopback)
+    # so the app pod's vmagent can scrape it cross-pod at {{ carlos_obs_pod }}:9100 over
+    # carlos-net. The host `/` IS mounted read-only at /host/root
+    # (--path.rootfs): without it node_filesystem_* reflected only the
+    # container's own overlay (which the DiskLow rule's fstype filter
+    # excludes) and the rule evaluated nothing. NOTE the coverage limit: the
+    # bind carries the ROOT filesystem only — separately-mounted volumes
+    # (a dedicated data/ or backup/ mount, the journal) do not appear as
+    # node_filesystem_* series, so DiskLow covers `/` and the monitor's
+    # statvfs sweep remains the authoritative all-volumes floor. Do NOT
+    # retire that sweep on the strength of this rule. Runs NON-ROOT as the
+    # image's own default (nobody, 65534): the filesystem collector needs
+    # only statfs, and the root-only per-process detail is deliberately
+    # given up.
+    - name: node-exporter
+      image: "{{ carlos_node_exporter_image }}"
+      args:
+        - "--path.procfs=/host/proc"
+        - "--path.sysfs=/host/sys"
+        - "--path.rootfs=/host/root"
+        - "--web.listen-address=:9100"
+      securityContext:
+        runAsUser: 65534
+        runAsGroup: 65534
+        runAsNonRoot: true
+        # Static binary reading mounted /host/{proc,sys} — no root-fs writes.
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        limits:
+          memory: "{{ carlos_node_exporter_mem_limit }}"
+          cpu: "{{ carlos_node_exporter_cpu_limit }}"
+      volumeMounts:
+        - name: host-proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: host-sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: host-root
+          mountPath: /host/root
+          readOnly: true
+
+    # Log store: persists everything logcollect ships, with retention. Web UI
+    # (query + live tail) on the host loopback; the authenticated log view
+    # (caddy, below) is the network-facing read path.
+    #
+    # STORE AUTH (default ON — carlos_obs_http_auth): VictoriaLogs (:9428,
+    # holding up to {{ carlos_log_retention }} of PHI-adjacent log content), VictoriaMetrics
+    # (:8428) and vmalert's API all require HTTP basic auth — without it any
+    # local OS user or SSRF foothold could read the whole retention window
+    # over host loopback with zero credentials. The password reaches the
+    # containers by NAME (the {{ carlos_instance }}-obs-http podman secret,
+    # mounted at /etc/obs-auth and consumed via file:// / passwordFile
+    # flags) — the plaintext is never in this 0644 rendered spec. Every
+    # client carries the matching credential: vmagent (remote-write + the VL
+    # scrape job), vector's sink, the Caddy logview header_up, and the
+    # monitor/check curls (off-argv via `curl -K -`). `carlos-ctl check`
+    # positively asserts a credential-less query is REJECTED. Setting
+    # carlos_obs_http_auth: false restores the legacy unauthenticated
+    # posture and re-accepts the old risk-register row 1.
+    - name: victorialogs
+      image: "{{ carlos_victorialogs_image }}"
+      args:
+        - "-storageDataPath=/victoria-logs-data"
+        - "-retentionPeriod={{ carlos_log_retention }}"
+{% if carlos_obs_http_auth | bool %}
+        - "-httpAuth.username={{ carlos_obs_http_user }}"
+        - "-httpAuth.password=file:///etc/obs-auth/password"
+{% endif %}
+      # Static Go binary, no capabilities needed. NON-ROOT (uid 10010): the
+      # official image defaults to root for no functional reason; its only
+      # writable path is the store dir, chowned by obs-init.
+      securityContext:
+        runAsUser: 10010
+        runAsGroup: 10010
+        runAsNonRoot: true
+        # Static binary; the store dir is a mount — no root-fs writes.
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        limits:
+          memory: "{{ carlos_victorialogs_mem_limit }}"
+          cpu: "{{ carlos_victorialogs_cpu_limit }}"
+      ports:
+        - containerPort: 9428
+          hostPort: {{ carlos_victorialogs_port }}
+          hostIP: "127.0.0.1"
+      env:
+        - name: TZ
+          value: "{{ carlos_tz }}"
+      volumeMounts:
+        - name: victorialogs-data
+          mountPath: /victoria-logs-data
+{% if carlos_obs_http_auth | bool %}
+        - name: obs-http-auth
+          mountPath: /etc/obs-auth
+          readOnly: true
+{% endif %}
+
+    # Metric store: the app-pod vmagent remote-writes here as {{ carlos_obs_pod }}:8428
+    # over the shared carlos-net network (buffered on the producer if down).
+    - name: victoria-metrics
+      image: "{{ carlos_victoriametrics_image }}"
+      args:
+        - "-storageDataPath=/victoria-metrics-data"
+        - "-retentionPeriod={{ carlos_metrics_retention }}"
+        - "-httpListenAddr=:8428"
+{% if carlos_obs_http_auth | bool %}
+        - "-httpAuth.username={{ carlos_obs_http_user }}"
+        - "-httpAuth.password=file:///etc/obs-auth/password"
+{% endif %}
+      # Static Go binary, no capabilities needed. NON-ROOT (uid 10011), same
+      # rationale as victorialogs; store dir chowned by obs-init.
+      securityContext:
+        runAsUser: 10011
+        runAsGroup: 10011
+        runAsNonRoot: true
+        # Static binary; the store dir is a mount — no root-fs writes.
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        limits:
+          memory: "{{ carlos_victoriametrics_mem_limit }}"
+          cpu: "{{ carlos_victoriametrics_cpu_limit }}"
+      ports:
+        - containerPort: 8428
+          hostPort: {{ carlos_victoriametrics_port }}
+          hostIP: "127.0.0.1"
+      env:
+        - name: TZ
+          value: "{{ carlos_tz }}"
+      volumeMounts:
+        - name: victoria-metrics-data
+          mountPath: /victoria-metrics-data
+{% if carlos_obs_http_auth | bool %}
+        - name: obs-http-auth
+          mountPath: /etc/obs-auth
+          readOnly: true
+{% endif %}
+
+    # Alert rule evaluator: vmalert continuously evaluates the metric-derived
+    # alert rules (rules.yml) against the co-located VictoriaMetrics — the
+    # PromQL checks the shell monitor used to poll by hand on its hourly sweep.
+    # `carlos-ctl monitor` now just polls vmalert's /api/v1/alerts for firing
+    # alerts. -notifier.blackhole: no Alertmanager is deployed — the monitor
+    # relays alert state instead, so vmalert only needs to evaluate and expose.
+    - name: vmalert
+      image: "{{ carlos_vmalert_image }}"
+      args:
+        # In-pod loopback: victoria-metrics listens on the FIXED :8428 inside the
+        # pod netns (the carlos_victoriametrics_port var is only the HOST publish
+        # port) — target the fixed listener so a host-port override cannot break
+        # rule evaluation.
+        - "-datasource.url=http://127.0.0.1:8428"
+        - "-rule=/etc/vmalert/rules.yml"
+        # Bind WIDE inside the pod netns like the other hostPort-published
+        # listeners (victoria-metrics :8428, victorialogs :9428): podman's
+        # port forward (rootful DNAT and rootless rootlessport alike)
+        # delivers published traffic to the pod's interface IP, never the
+        # pod-netns loopback — a 127.0.0.1 bind here is UNREACHABLE through
+        # its own hostPort, so the monitor's /api/v1/alerts poll would fail
+        # forever and no metric-derived alert could relay. The hostIP
+        # 127.0.0.1 on the publish below already provides the host-side
+        # loopback-only boundary.
+        - "-httpListenAddr=:{{ carlos_vmalert_port }}"
+        - "-notifier.blackhole"
+{% if carlos_obs_http_auth | bool %}
+        # Same credential both ways: its own API requires it, and it presents
+        # it to the authed VictoriaMetrics datasource.
+        - "-httpAuth.username={{ carlos_obs_http_user }}"
+        - "-httpAuth.password=file:///etc/obs-auth/password"
+        - "-datasource.basicAuth.username={{ carlos_obs_http_user }}"
+        - "-datasource.basicAuth.passwordFile=/etc/obs-auth/password"
+{% endif %}
+      # Static Go binary, no capabilities needed. NON-ROOT (uid 10014), same
+      # rationale as victoria-metrics; stateless (rules are a read-only mount,
+      # remote-read/-write unused), so obs-init has nothing to chown for it.
+      securityContext:
+        runAsUser: 10014
+        runAsGroup: 10014
+        runAsNonRoot: true
+        # Static binary; the rules file is a read-only mount — no root-fs writes.
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        limits:
+          memory: "{{ carlos_vmalert_mem_limit }}"
+          cpu: "{{ carlos_vmalert_cpu_limit }}"
+      ports:
+        - containerPort: {{ carlos_vmalert_port }}
+          hostPort: {{ carlos_vmalert_port }}
+          hostIP: "127.0.0.1"
+      env:
+        - name: TZ
+          value: "{{ carlos_tz }}"
+      volumeMounts:
+        - name: vmalert-conf
+          mountPath: /etc/vmalert/rules.yml
+          subPath: rules.yml
+          readOnly: true
+{% if carlos_obs_http_auth | bool %}
+        - name: obs-http-auth
+          mountPath: /etc/obs-auth
+          readOnly: true
+{% endif %}
+
+    # The single log collector: Vector reads the host's persistent journal
+    # (into which podman's journald driver writes the app-pod containers) and
+    # ships to victorialogs over pod loopback. Disk-buffered + cursor-
+    # checkpointed, so a victorialogs outage backfills on recovery. Runs as
+    # root to read /var/log/journal.
+    - name: logcollect
+      image: "{{ carlos_vector_image }}"
+      command: ["/usr/bin/vector", "--config", "/etc/vector/journald.toml"]
+      # Runs as container uid 0 with ZERO capabilities. Under the ROOTLESS
+      # engine, container uid 0 is the unprivileged SERVICE_USER on the host —
+      # NOT host root — so the root-owned system.journal is unreadable (and
+      # unneeded). What this reads is the deployment's OWN log data: the pods
+      # are user-manager services, so podman's journald driver writes their
+      # output to the service user's user-<uid>.journal, which journald ACLs
+      # to that user. That path requires journald's default SplitMode=uid
+      # (see README, Requirements); journalctl inside the container skips the
+      # unreadable system files and reads the user journal via the ACL.
+      # Validate live: the journald source shells out to journalctl.
+      securityContext:
+        runAsUser: 0
+        # Vector's cursor + disk buffer live on the mounted /var/lib/vector;
+        # nothing writes the root filesystem (journalctl only reads).
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        limits:
+          memory: "{{ carlos_logcollect_mem_limit }}"
+          cpu: "{{ carlos_logcollect_cpu_limit }}"
+      env:
+        - name: TZ
+          value: "{{ carlos_tz }}"
+      volumeMounts:
+        - name: vector-obs-conf
+          mountPath: /etc/vector/journald.toml
+          subPath: journald-collector.toml
+          readOnly: true
+        - name: host-journal
+          mountPath: /var/log/journal
+          readOnly: true
+        - name: machine-id
+          mountPath: /etc/machine-id
+          readOnly: true
+        - name: vector-collector-data
+          mountPath: /var/lib/vector
+
+    # Authenticated HTTPS admin/observability view. Caddy terminates TLS with
+    # the same certificate as the WAF and basic-auths read-only routes into the
+    # VictoriaLogs UI (/select/*) and the VictoriaMetrics UI (/vmui, /vmapi/*).
+    # Ingestion/admin endpoints of both stores stay unroutable from outside.
+    - name: logview
+      image: "{{ carlos_caddy_image }}"
+      # Caddy serves on :9443 (>1024) with operator-provided certs. NON-ROOT
+      # (uid 10013): the official image defaults to root only for :80/:443
+      # binding, which this deployment doesn't use; its writable state
+      # (XDG data/config) lives on emptyDirs chowned by obs-init, and the
+      # TLS cert+key are read from the logview-certs tmpfs emptyDir that
+      # obs-init stages them into owned by uid 10013 (the host certs dir is
+      # 0700 and untraversable by this uid directly).
+      securityContext:
+        runAsUser: 10013
+        runAsGroup: 10013
+        runAsNonRoot: true
+        # Caddy's writable XDG state is already on chowned emptyDirs — the
+        # root filesystem needs no writes.
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+          # The Caddy binary carries cap_net_bind_service. With
+          # no-new-privileges, that capability must also be in the container's
+          # permitted set even though this service listens on port 9443.
+          add: ["NET_BIND_SERVICE"]
+      resources:
+        limits:
+          memory: "{{ carlos_caddy_mem_limit }}"
+          cpu: "{{ carlos_caddy_cpu_limit }}"
+      ports:
+        - containerPort: 9443
+          hostPort: {{ carlos_log_view_port }}
+          hostIP: "{{ carlos_bind_ip }}"
+      env:
+        - name: TZ
+          value: "{{ carlos_tz }}"
+        # Point Caddy's writable state at the chowned emptyDirs (the image
+        # defaults live under /root when running as uid 0).
+        - name: XDG_DATA_HOME
+          value: "/caddy-data"
+        - name: XDG_CONFIG_HOME
+          value: "/caddy-config"
+      volumeMounts:
+        - name: caddy-conf
+          mountPath: /etc/caddy/Caddyfile
+          subPath: Caddyfile
+          readOnly: true
+        # Staged cert+key (tmpfs, owned 10013 by obs-init) — the host certs
+        # dir is 0700 and untraversable by this non-root uid directly.
+        - name: logview-certs
+          mountPath: /etc/ssl/private
+          readOnly: true
+        - name: caddy-data
+          mountPath: /caddy-data
+        - name: caddy-config
+          mountPath: /caddy-config
+
+  volumes:
+    # host metrics sources for node-exporter (read-only)
+    - name: host-proc
+      hostPath:
+        path: /proc
+        type: Directory
+    - name: host-sys
+      hostPath:
+        path: /sys
+        type: Directory
+    - name: host-root
+      hostPath:
+        path: /
+        type: Directory
+    - name: victorialogs-data
+      hostPath:
+        path: {{ carlos_emr_home }}/logs/victoria-logs-data
+        type: DirectoryOrCreate
+    - name: victoria-metrics-data
+      hostPath:
+        path: {{ carlos_emr_home }}/metrics/victoria-metrics-data
+        type: DirectoryOrCreate
+    - name: vector-obs-conf
+      hostPath:
+        path: {{ carlos_emr_home }}/container/conf/vector
+        type: Directory
+    # vmalert alert rules (rules.yml, mounted via subPath into the vmalert
+    # container above).
+    - name: vmalert-conf
+      hostPath:
+        path: {{ carlos_emr_home }}/container/conf/vmalert
+        type: Directory
+{% if carlos_obs_http_auth | bool %}
+    # The store basic-auth credential, referenced by NAME (podman secret) —
+    # 0444 is pod-private: this volume never leaves the pod's mount ns.
+    - name: obs-http-auth
+      secret:
+        secretName: {{ carlos_instance }}-obs-http
+        defaultMode: 0444
+{% endif %}
+    - name: vector-collector-data
+      hostPath:
+        path: {{ carlos_emr_home }}/logs/vector-collector-data
+        type: DirectoryOrCreate
+    # The host's persistent journal (podman journald driver writes app-pod
+    # container output here). Requires journald Storage=persistent — carlos-ctl
+    # init ensures /var/log/journal exists.
+    - name: host-journal
+      hostPath:
+        path: /var/log/journal
+        type: Directory
+    - name: machine-id
+      hostPath:
+        path: /etc/machine-id
+        type: File
+    - name: caddy-conf
+      hostPath:
+        path: {{ carlos_emr_home }}/container/conf/caddy
+        type: Directory
+    - name: waf-certs
+      hostPath:
+        path: {{ carlos_emr_home }}/container/conf/waf/certs
+        type: Directory
+    # Caddy's writable state (tmpfs; chowned to the non-root logview uid by
+    # obs-init). Nothing worth persisting lives here — certs are operator-
+    # provided and auto_https is off.
+    - name: caddy-data
+      emptyDir:
+        medium: Memory
+    - name: caddy-config
+      emptyDir:
+        medium: Memory
+    # Staged TLS cert+key (tmpfs) the non-root logview reads — obs-init copies
+    # them here from the 0700 waf-certs hostPath and chowns to uid 10013.
+    - name: logview-certs
+      emptyDir:
+        medium: Memory

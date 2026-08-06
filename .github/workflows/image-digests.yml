@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Weekly image-digest freshness check (finding C25): every third-party image
+# is tag@sha256-pinned (defaults/main.yml, carlos_ctl/config.py) and the two
+# Containerfiles pin their base images the same way — good for integrity,
+# but the pins only move when a human moves them, so a Tomcat/MariaDB/nginx
+# CVE fix can sit unadopted with no signal. This job re-resolves each pinned
+# tag with skopeo and FAILS VISIBLY when the tag's current digest no longer
+# matches the pin. Advisory freshness signal only: it never auto-bumps —
+# review the upstream change, update the pin, and let CI verify.
+name: image-digest-freshness
+on:
+  schedule:
+    - cron: "17 6 * * 1"  # Mondays 06:17 UTC (offset to dodge top-of-hour load)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  digest-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: Install skopeo
+        run: sudo apt-get update -q && sudo apt-get install -y -q skopeo
+      - name: Compare every tag@sha256 pin against the tag's current digest
+        run: |
+          set -euo pipefail
+          # Collect image pins of the form repo/name:tag@sha256:... from the
+          # role defaults, the CLI's built-in defaults, and both Containerfiles.
+          mapfile -t pins < <(
+            grep -rhoE '[a-z0-9.-]+\.[a-z]{2,}/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' \
+              ansible/roles/carlos_podman/defaults/main.yml \
+              carlos_ctl/config.py \
+              Containerfile Containerfile.drugref | sort -u
+          )
+          if [ "${#pins[@]}" -eq 0 ]; then
+            echo "FAIL: found no image pins to check — the grep pattern drifted from the pin format"
+            exit 1
+          fi
+          drift=0
+          unresolved=0
+          for pin in "${pins[@]}"; do
+            ref="${pin%@sha256:*}"        # repo:tag
+            want="sha256:${pin##*@sha256:}"
+            # Retry per pin: transient registry hiccups and rate limits are
+            # routine on shared runner IPs, but a pin that STAYS unresolvable
+            # (deleted/renamed upstream tag) is the loudest possible "this pin
+            # is dead" signal and must fail the job — a skipped pin is an
+            # unchecked pin, which is exactly the gap this workflow closes.
+            have=""
+            for attempt in 1 2 3; do
+              have="$(skopeo inspect --format '{{.Digest}}' "docker://${ref}" 2>/dev/null || true)"
+              [ -n "$have" ] && break
+              sleep $((attempt * 20))
+            done
+            if [ -z "$have" ]; then
+              echo "FAIL  ${ref}: could not resolve the current digest after 3 attempts"
+              echo "      (persistent rate limit, or the upstream tag was deleted/renamed — check the pin)"
+              unresolved=1
+              continue
+            fi
+            if [ "$have" != "$want" ]; then
+              echo "DRIFT ${ref}: pinned ${want} but the tag now resolves to ${have}"
+              echo "      upstream moved the tag (usually a patch/CVE respin) — review and bump the pin"
+              drift=1
+            else
+              echo "ok    ${ref}"
+            fi
+          done
+          if [ "$unresolved" -ne 0 ]; then
+            echo "FAIL: at least one pin could not be resolved — that pin went UNCHECKED this run"
+            exit 1
+          fi
+          exit "$drift"

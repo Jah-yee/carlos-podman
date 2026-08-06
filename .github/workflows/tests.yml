@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# CI for carlos-podman:
+#   - lint + types + unit tests for the carlos_ctl Python CLI (3.9 = the EL9
+#     production floor pyproject declares, + a current interpreter)
+#   - the hermetic e2e suite (stubs for podman/systemctl/sops/…; nothing
+#     outside a throwaway workdir is touched). Runs under sudo: production
+#     carlos-ctl runs as root and several paths (/run tmpfs staging) are
+#     root-gated.
+#   - the Ansible role checks (syntax, lint, --check drift review, render/
+#     idempotency/obs-toggle, sibling-collision asserts)
+#   - Containerfile validation (BuildKit --check): parse + rule lint without
+#     executing the build — an ENV-before-FROM class mistake must fail CI,
+#     not the first production `carlos-ctl build`.
+#
+# Actions are pinned to commit SHAs, not tags, for the same reason the
+# Containerfiles digest-pin base images: a re-pushed tag must never change
+# what runs against this repo (the runner sees a write-capable token).
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.9 mirrors pyproject's requires-python floor (EL9 hosts); a
+        # 3.10+-only construct must fail CI, not the production host.
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "${{ matrix.python-version }}"
+      # Pinned: an unpinned linter release changing its rule set must not
+      # flip CI red (or silently green) without a reviewed bump. pytest is
+      # split by interpreter: 9.x requires Python >=3.10, so the 3.9 floor
+      # (EL9) pins the last 3.9-compatible line (8.4.x) while a current
+      # interpreter stays on 9.x. Both are exact pins, same no-surprise-churn
+      # rationale.
+      - name: install toolchain
+        run: >
+          pip install ruff==0.15.8 mypy==1.19.1
+          "pytest==9.1.1; python_version >= '3.10'"
+          "pytest==8.4.2; python_version < '3.10'"
+          PyYAML==6.0.1 bcrypt==5.0.0 types-PyYAML
+      - name: ruff
+        run: ruff check carlos_ctl tests/unit
+      - name: mypy
+        run: mypy carlos_ctl
+      - name: pytest (unit)
+        run: pytest tests/unit -q
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - name: bash syntax (harness + stubs)
+        run: |
+          bash -n tests/run-tests.sh tests/ansible-checks.sh
+          for f in tests/stubs/*; do bash -n "$f"; done
+      - name: shellcheck (enforcing)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning tests/run-tests.sh tests/ansible-checks.sh tests/stubs/*
+      - name: python deps for the CLI under test
+        run: sudo apt-get install -y -qq python3-yaml python3-bcrypt
+      - name: hermetic e2e suite
+        run: sudo tests/run-tests.sh
+
+  ansible:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: "3.12"
+      - name: install ansible toolchain
+        # ansible-lint deliberately floats (advisory linter; a new release
+        # flagging new style rules is acceptable churn, unlike the enforced
+        # python toolchain above). bcrypt<4.1: passlib 1.7.4's bcrypt backend
+        # breaks against bcrypt>=4.1 (the misleading "72 bytes" error), and
+        # the role's --check run exercises password_hash('bcrypt').
+        run: |
+          pip install "ansible-core>=2.19,<2.20" ansible-lint passlib "bcrypt<4.1" netaddr PyYAML
+          ansible-galaxy collection install ansible.utils
+      - name: role checks (syntax, lint, --check, render, idempotency, obs toggle)
+        run: tests/ansible-checks.sh
+
+  containerfiles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      # BuildKit --check runs the frontend's parse + build checks WITHOUT
+      # executing any stage: instruction placement (ENV before FROM),
+      # undeclared ARG consumption, casing, JSON-form recommendations. The
+      # full image build (Maven over the whole EMR) is deliberately not run
+      # in CI — validation here is about the files being buildable at all.
+      - name: buildx check (CARLOS image)
+        run: docker buildx build --check -f Containerfile .
+      - name: buildx check (DrugRef image)
+        run: docker buildx build --check -f Containerfile.drugref .

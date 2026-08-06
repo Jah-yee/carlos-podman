@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SPDX-License-Identifier: AGPL-3.0-only
+  Copyright (C) 2026 CARLOS Contributors
+
+  External Tomcat context descriptor for the drugref2 webapp, baked into the
+  carlos-drugref image at conf/Catalina/localhost/drugref2.xml by
+  Containerfile.drugref. Tomcat prefers an external descriptor over the WAR's
+  own META-INF/context.xml and ignores the in-WAR file entirely.
+
+  Why override at all: the in-WAR descriptor guards the app with
+    allow="${drugref.allowedRemoteAddresses:127.0.0.1/32,::1/128}"
+  but Tomcat's RemoteCIDRValve splits `allow` on commas BEFORE system-property
+  substitution runs, so a ${name:a,b} placeholder whose DEFAULT contains a
+  comma fails to parse — the upstream carlos devcontainer overrides the valve
+  for exactly this reason (see carlos .devcontainer/drugref/drugref2.xml).
+  Values are therefore HARDCODED here.
+
+  Loopback-only is exactly the pod's trust model: CARLOS reaches DrugRef over
+  the shared pod network namespace at 127.0.0.1:8180, port 8180 is never
+  published, and no other client is legitimate. (The devcontainer needs the
+  wider RFC1918 list because its containers sit on a bridge network; the pod
+  does not.)
+-->
+<Context>
+    <Valve className="org.apache.catalina.valves.RemoteCIDRValve"
+           allow="127.0.0.0/8,::1" />
+</Context>

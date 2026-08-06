@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Supersede/cleanup: remove artifacts of the bash-era install so its timers
+# can never call the old scripts with the old credential layout, and remove
+# obs-pod artifacts when the profile is toggled OFF (install-when-true,
+# remove-when-false — toggling is always a plain re-run, never a special path).
+---
+- name: Remove superseded bash helper scripts (their logic lives in carlos-ctl now)
+  ansible.builtin.file:
+    path: "{{ carlos_emr_home }}/container/{{ item }}"
+    state: absent
+  loop:
+    - carlos-backup.sh
+    - carlos-alert.sh
+    - carlos-monitor.sh
+    - carlos-secrets.sh
+    - carlos-guard.sh
+
+- name: Remove the bash-era sync-conf manifest (drift handling is playbook re-runs)
+  ansible.builtin.file:
+    path: "{{ carlos_emr_home }}/container/.shipped-manifest"
+    state: absent
+
+# --- obs profile OFF: tear down the observability artifacts -----------------------
+- name: Stop and remove the obs pod artifacts (profile disabled)
+  when: not (carlos_obs_enabled | bool)
+  block:
+    - name: Stop the obs pod user unit (best-effort — may not exist)
+      ansible.builtin.command:
+        cmd: "systemctl --user -M {{ carlos_service_user }}@ stop {{ carlos_obs_pod }}.service"
+      register: _obs_stop
+      failed_when: false
+      changed_when: _obs_stop.rc == 0
+
+    - name: Remove the obs quadlet, rendered spec, and obs-only configs
+      # Historical metric/log data under {{ carlos_emr_home }}/logs|metrics is
+      # PRESERVED on disk unless removed by hand — stated in the README.
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ carlos_quadlet_root }}/{{ carlos_service_uid }}/{{ carlos_obs_pod }}.kube"
+        - "{{ carlos_emr_home }}/container/{{ carlos_obs_pod }}.yaml"
+        - "{{ carlos_conf_dir }}/vector/journald-collector.toml"
+        - "{{ carlos_conf_dir }}/vmagent/scrape.yml"
+        - "{{ carlos_conf_dir }}/vmalert/rules.yml"
+      notify: user daemon-reload
+
+# --- acme OFF: tear down the cert-renew units (tls mode toggled away) --------------
+# Same install-when-true/remove-when-false contract as the obs profile above:
+# instance.yml renders and enables cert-renew.{service,timer} only in acme
+# mode, so a toggle away from acme would otherwise leave the timer enabled
+# and firing daily into `carlos-ctl cert-renew`'s "not acme mode" refusal —
+# an OnFailure page every day until someone disables the stale timer by hand.
+- name: Remove the acme cert-renew units (tls mode is not acme)
+  when: carlos_tls_mode != 'acme'
+  block:
+    - name: Disable and stop the cert-renew timer (best-effort — may not exist)
+      ansible.builtin.systemd:
+        name: "{{ carlos_instance }}-cert-renew.timer"
+        enabled: false
+        state: stopped
+      failed_when: false
+
+    - name: Remove the cert-renew unit files
+      ansible.builtin.file:
+        path: "{{ carlos_systemd_dir }}/{{ carlos_instance }}-cert-renew.{{ item }}"
+        state: absent
+      loop:
+        - service
+        - timer
+      notify: systemd daemon-reload

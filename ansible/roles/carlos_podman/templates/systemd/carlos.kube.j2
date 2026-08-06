@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Quadlet unit for the {{ carlos_app_pod }} pod — a ROOTLESS USER unit. The carlos-podman Ansible role
+# installs it to /etc/containers/systemd/users/<uid>/{{ carlos_instance }}.kube, from
+# which the service user's `systemd --user` generates {{ carlos_instance }}.service.
+# `carlos-ctl play` is `systemctl --user -M <user>@ restart {{ carlos_instance }}.service`
+# under the hood.
+#
+# NO ordering against {{ carlos_instance }}-secrets.service: that is a ROOT SYSTEM unit,
+# invisible to (and unorderable from) this user manager. Boot ordering is the
+# secrets unit's own Before=user@<uid>.service; a failed unseal is caught
+# loudly at pod start by carlos-init's __SEALED__ guard, and Restart=on-failure
+# retries until the fragments render. Likewise NO OnFailure={{ carlos_instance }}-alert@:
+# a user unit cannot trigger a system template — the 15-min monitor sweep's
+# systemctl --user is-active check covers pod-unit failure instead.
+[Unit]
+Description=CARLOS EMR app pod (CARLOS, DrugRef, MariaDB, metrics)
+# network-online.target rarely exists in a `systemd --user` manager; when it
+# is absent these two lines are inert (missing Wants=/After= are ignored). A
+# boot race against interface/IP assignment is absorbed by Restart=on-failure.
+Wants=network-online.target
+After=network-online.target
+# Never give up permanently (StartLimitIntervalSec=0 disables the start-rate
+# limiter): a transient fault (network race, slow disk, OOM recovery) that
+# outlasts a burst budget would otherwise leave the EMR PERMANENTLY stopped
+# until a human intervenes, and the 15-min monitor sweep is the only detector.
+# RestartSec=30 below still paces the retries, so a genuine config error
+# (e.g. the documented innodb_page_size mismatch) loops calmly at 2/min
+# instead of thrashing.
+StartLimitIntervalSec=0
+# The obs pod holds the log/metric stores + collector; start it first so this
+# pod's journald output and vmagent remote-writes have somewhere to land
+# (both buffer if it is briefly down, so this is ordering, not a hard require).
+Wants={{ carlos_obs_pod }}.service
+After={{ carlos_obs_pod }}.service
+
+[Kube]
+Yaml={{ carlos_emr_home }}/container/{{ carlos_app_pod }}.yaml
+# Send every container's stdout/stderr to the (user) journal, where the obs pod's
+# logcollect tails it. `podman logs` still works.
+LogDriver=journald
+# Shared network so vmagent can remote-write to the obs pod ({{ carlos_obs_pod }}:8428).
+Network={{ carlos_net_name }}
+# Also join the edge network so the {{ carlos_waf_pod }} pod can proxy to {{ carlos_app_pod }}:8443
+# (the TLS backend hop) by pod name. The WAF pod joins ONLY the edge net; this
+# pod joins both. (Plaintext :8080 is loopback-pinned in server.xml, not cross-pod.)
+# (podman #28172 interface-ordering nondeterminism is moot here: this pod
+# publishes no host ports.)
+Network={{ carlos_edge_net_name }}
+
+[Service]
+Restart=on-failure
+RestartSec=30
+# First start pulls the mariadb/exporter images.
+TimeoutStartSec=900
+
+[Install]
+# User-manager target (multi-user.target does not exist in `systemd --user`).
+WantedBy=default.target

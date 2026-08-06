@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Example inventory: one entry PER INSTANCE. Two instances on one machine
+# share ansible_host but have distinct names + host_vars — the role's
+# assert tasks cross-check their EMR homes and port sets.
+#
+# Per-instance settings live in host_vars/<name>.yml (start one with
+# `carlos-ctl setup`, or copy the keys from roles/carlos_podman/defaults/).
+# Vault the secrets:
+#   ansible-vault encrypt_string --name carlos_db_root_password
+[carlos_instances]
+carlos      ansible_host=emr1.example.ca
+# clinicb   ansible_host=emr1.example.ca   # second instance, same machine

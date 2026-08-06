@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Installed by the carlos-podman Ansible role to /etc/systemd/system/.
+[Unit]
+Description=CARLOS EMR binlog shipping every {{ carlos_binlog_oncalendar }}
+# Fire only after the first successful `carlos-ctl play` created the go-live
+# marker: the playbook enables these timers without starting them (they would
+# fail — and page — against a down stack), and without this gate a REBOOT in
+# the provision->first-play window (image builds and TLS certs routinely take
+# days) would start them anyway and resurrect the failure storm.
+ConditionPathExists={{ carlos_emr_home }}/container/.deployed
+
+[Timer]
+OnCalendar={{ carlos_binlog_oncalendar }}
+# No Persistent=true: a missed 15-minute run is superseded by the next one
+# within 15 minutes anyway, and a persistent catch-up fires at BOOT — before
+# the user-unit pods (which a system timer cannot order after) have brought
+# the DB up — paging on every reboot. The in-script boot grace
+# (BOOT_GRACE_SECONDS) covers the calendar fire that lands in that window.
+# small jitter so the two 15-minute timers (binlog, docs) and other
+# instances' schedules do not all fire on the exact same second.
+RandomizedDelaySec=90
+
+[Install]
+WantedBy=timers.target

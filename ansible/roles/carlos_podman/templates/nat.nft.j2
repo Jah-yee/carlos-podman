@@ -1,0 +1,119 @@
+#!/usr/sbin/nft -f
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Rendered by the carlos-podman Ansible role — do not edit; re-run the playbook
+# after changing carlos_bind_ip/carlos_https_port/carlos_https_publish_port.
+# dnat to {{ carlos_bind_ip }}:{{ carlos_https_publish_port }} (NOT `redirect`): the rootless WAF's
+# port forwarder listens on {{ carlos_bind_ip }}:{{ carlos_https_publish_port }} specifically, but
+# `redirect` rewrites the destination to the incoming-interface primary address
+# (prerouting) or to 127.0.0.1 (output) — neither is guaranteed to be {{ carlos_bind_ip }},
+# so a host-local probe (the monitor's served-cert check) or a VIP BIND_IP would
+# miss the listener. Explicit dnat to {{ carlos_bind_ip }} is unambiguous on both hooks.
+# IPv4 only (table ip): the front-door DNAT rewrites IPv4 dport traffic to
+# the rootless WAF's IPv4 publish address. A client reaching the host over
+# IPv6 is NOT redirected — bind the host's AAAA off, or front the host with
+# an IPv4-only address, if IPv6 clients must not bypass the redirect.
+table ip {{ carlos_instance }}-nat
+delete table ip {{ carlos_instance }}-nat
+table ip {{ carlos_instance }}-nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat;
+        ip daddr {{ carlos_bind_ip }} tcp dport {{ carlos_https_port }} dnat to {{ carlos_bind_ip }}:{{ carlos_https_publish_port }}
+{% if carlos_tls_mode | default('selfsigned', true) == 'acme' %}
+        # acme mode: Let's Encrypt HTTP-01 arrives on :80; certbot's transient
+        # standalone listener publishes on the rootless-bindable HTTP publish
+        # port for the seconds a renewal runs (no steady-state :80 listener —
+        # outside a renewal these SYNs meet a closed port).
+        ip daddr {{ carlos_bind_ip }} tcp dport 80 dnat to {{ carlos_bind_ip }}:{{ carlos_http_publish_port }}
+{% endif %}
+    }
+    chain output {
+        type nat hook output priority -100;
+        ip daddr {{ carlos_bind_ip }} tcp dport {{ carlos_https_port }} dnat to {{ carlos_bind_ip }}:{{ carlos_https_publish_port }}
+{% if carlos_tls_mode | default('selfsigned', true) == 'acme' %}
+        ip daddr {{ carlos_bind_ip }} tcp dport 80 dnat to {{ carlos_bind_ip }}:{{ carlos_http_publish_port }}
+{% endif %}
+    }
+}
+{% if carlos_host_firewall_enabled | bool %}
+
+# Host default-deny (carlos_host_firewall_enabled). Host-global, so
+# on a multi-instance host enable it for ONE instance only. Loopback,
+# established/related, ICMP, SSH, the front-door HTTPS port, and (when the
+# log-view filter is on) the log-view port per its CIDR are allowed; all
+# other inbound is dropped. IPv6 inbound is dropped except established/ICMPv6
+# (the app front door is IPv4 DNAT). Declare-then-delete keeps it idempotent.
+table inet {{ carlos_instance }}-hostfw
+delete table inet {{ carlos_instance }}-hostfw
+table inet {{ carlos_instance }}-hostfw {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        ct state established,related accept
+        iif lo accept
+        meta l4proto { icmp, icmpv6 } accept
+        tcp dport {{ carlos_host_firewall_ssh_port }} accept
+        # The front door: PREROUTING (priority dstnat, above) has ALREADY
+        # DNAT'd {{ carlos_https_port }} -> {{ carlos_https_publish_port }} by the time this input hook
+        # runs, so the packet's dport here is the PUBLISH port — an allow on
+        # {{ carlos_https_port }} would never match and the SYN would hit the drop policy
+        # (EMR offline the moment the firewall is enabled). Match the
+        # conntrack ORIGINAL destination port (pre-DNAT, intention-revealing;
+        # l4proto-qualified — a bare proto-dst would admit UDP/SCTP {{ carlos_https_port }}
+        # through the default-deny too) and the publish port for direct hits.
+        ip daddr {{ carlos_bind_ip }} meta l4proto tcp ct original proto-dst {{ carlos_https_port }} accept
+        ip daddr {{ carlos_bind_ip }} tcp dport {{ carlos_https_publish_port }} accept
+{% if carlos_tls_mode | default('selfsigned', true) == 'acme' %}
+        # acme HTTP-01 (same conntrack-original pattern as the front door).
+        ip daddr {{ carlos_bind_ip }} meta l4proto tcp ct original proto-dst 80 accept
+        ip daddr {{ carlos_bind_ip }} tcp dport {{ carlos_http_publish_port }} accept
+{% endif %}
+{% if carlos_log_view_filter_enabled | bool %}
+        # daddr-qualified to match the front-door rules above: without it these
+        # would admit the log-view port on EVERY local address, not just the
+        # bind IP the log view actually publishes on.
+        ip daddr {{ carlos_bind_ip }} ip saddr {{ carlos_bind_ip }} tcp dport {{ carlos_log_view_port }} accept
+        ip daddr {{ carlos_bind_ip }} ip saddr {{ carlos_log_view_allow }} tcp dport {{ carlos_log_view_port }} accept
+{% endif %}
+{% for extra in carlos_host_firewall_extra_allow | default([]) %}
+        # Extra allow (carlos_host_firewall_extra_allow): the host firewall is
+        # HOST-GLOBAL and single-owner, so on a multi-instance machine the
+        # owning instance must admit its SIBLINGS' front doors here (review
+        # finding: without these entries a sibling's bind_ip:443 SYNs hit the
+        # drop policy and that clinic goes dark). Same conntrack-original
+        # pattern as the owner's own front door, covering DNAT'd traffic.
+        ip daddr {{ extra.ip }} meta l4proto tcp ct original proto-dst {{ extra.port }} accept
+        ip daddr {{ extra.ip }} tcp dport {{ extra.port }} accept
+{% endfor %}
+    }
+}
+{% else %}
+
+table inet {{ carlos_instance }}-hostfw
+delete table inet {{ carlos_instance }}-hostfw
+{% endif %}
+{% if carlos_log_view_filter_enabled | bool %}
+
+# Log-view source restriction: the basic_auth+TLS log view fronts {{ carlos_log_retention | default('180d') }}
+# of PHI-bearing logs with one shared credential and no lockout — bound who
+# can even reach it. {{ carlos_bind_ip }} itself is allowed so host-local access (the
+# monitor, an SSH tunnel) keeps working when the allow set is narrower.
+table inet {{ carlos_instance }}-filter
+delete table inet {{ carlos_instance }}-filter
+table inet {{ carlos_instance }}-filter {
+    chain input {
+        type filter hook input priority filter; policy accept;
+        ip daddr {{ carlos_bind_ip }} tcp dport {{ carlos_log_view_port }} ip saddr {{ carlos_bind_ip }} accept
+        ip daddr {{ carlos_bind_ip }} tcp dport {{ carlos_log_view_port }} ip saddr {{ carlos_log_view_allow }} accept
+        ip daddr {{ carlos_bind_ip }} tcp dport {{ carlos_log_view_port }} drop
+    }
+}
+{% else %}
+
+# Loopback BIND_IP: no filter is needed, but a PRIOR non-loopback config may
+# have loaded a {{ carlos_instance }}-filter table that would LINGER in the kernel after
+# switching to loopback (only uninstall removes it). Emit a declare-then-delete
+# so re-applying the ruleset tears down any stale filter table (idempotent: the
+# declare creates an empty one if absent, the delete removes it either way).
+table inet {{ carlos_instance }}-filter
+delete table inet {{ carlos_instance }}-filter
+{% endif %}

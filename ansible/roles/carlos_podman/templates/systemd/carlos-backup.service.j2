@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Installed by the carlos-podman Ansible role to /etc/systemd/system/.
+[Unit]
+Description=CARLOS EMR restic backup (db dump + documents + config)
+Wants=network-online.target
+After=network-online.target
+OnFailure={{ carlos_instance }}-alert@%n.service
+
+[Service]
+Type=oneshot
+# Type=oneshot defaults TimeoutStartSec to INFINITY: a hung run (repo lock
+# never released, network mount gone away) would sit forever and OnFailure
+# would never fire — the alert path only covers runs that EXIT. Cap well
+# above the slowest plausible nightly full on a large DB.
+TimeoutStartSec=12h
+# carlos-ctl reads the instance home from $EMR_HOME.
+Environment=EMR_HOME={{ carlos_emr_home }}
+ExecStart=/usr/local/sbin/carlos-ctl backup full
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# Hardening for a runuser + rootless-podman ROOT oneshot. The heavy
+# confinement the guard/nft oneshots carry is UNSAFE here and deliberately
+# omitted: NoNewPrivileges / RestrictSUIDSGID break runuser's setuid
+# transition into the service user; ProtectHome hides the service user's
+# HOME and /run/user, where rootless podman keeps its container storage and
+# runtime socket; ProtectControlGroups breaks podman's cgroup delegation.
+# These directives isolate /tmp and the kernel surface without touching any
+# of that.
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictRealtime=yes
+LockPersonality=yes

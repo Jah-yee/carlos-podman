@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# {{ ansible_managed | default('Managed by the carlos_podman Ansible role') }}
+# vmalert rules for instance '{{ carlos_instance }}' — the metric-derived
+# checks the shell monitor used to re-derive by polling the VictoriaMetrics
+# API once an hour. vmalert evaluates them CONTINUOUSLY; `carlos-ctl monitor`
+# polls /api/v1/alerts and relays anything firing through the alert path
+# (no Alertmanager is deployed — vmalert runs with -notifier.blackhole).
+#
+# `for:` windows absorb scrape blips so a single missed sample never pages;
+# the monitor's own throttle (ALERT_REMIND_HOURS) handles re-page pacing.
+groups:
+  - name: carlos-{{ carlos_instance }}
+    interval: 30s
+    rules:
+      - alert: MysqlDown
+        expr: mysql_up != 1
+        for: 5m
+        annotations:
+          summary: >-
+            MariaDB health: mysql_up != 1 (db down, or mysqld-exporter cannot
+            connect / read its .my.cnf)
+
+      - alert: ScrapeTargetDown
+        expr: up == 0
+        for: 10m
+        annotations:
+          summary: >-
+            metrics: scrape target {{ '{{ $labels.job }}' }} reporting down
+            (up == 0)
+
+      # ABSENCE is not health: the store answers but reports NO 'up' series
+      # at all — vmagent is not scraping anything (dead remote-write, mangled
+      # scrape config), so MysqlDown and ScrapeTargetDown silently read green.
+      - alert: ScrapingDead
+        expr: absent(up)
+        for: 10m
+        annotations:
+          summary: >-
+            metrics: no 'up' series in VictoriaMetrics — scraping appears
+            dead; mysql_up/scrape rules cannot be trusted
+
+      # Disk floor across real filesystems (tmpfs/overlay excluded). The
+      # monitor keeps its own statvfs check as the obs-independent floor;
+      # this rule adds continuous evaluation between monitor ticks.
+      - alert: DiskLow
+        expr: >-
+          100 * node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"}
+              / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"}
+          < {{ carlos_disk_min_free | default(10) }}
+        for: 15m
+        annotations:
+          summary: >-
+            low disk: {{ '{{ $labels.mountpoint }}' }} below
+            {{ carlos_disk_min_free | default(10) }}% free
+            ({{ '{{ $value | printf "%.0f" }}' }}% free)
+
+      # A running-but-non-shipping log pipeline leaves the {{ carlos_log_retention }}
+      # WAF PHI audit trail dying green: a live host always emits journald
+      # lines, so a zero ingest rate while VictoriaLogs is up means the
+      # pipeline is wedged (journald source, stream/prefix mismatch,
+      # back-pressure). Uses VictoriaLogs' self-exported ingestion counter
+      # (the victorialogs scrape job in scrape.yml).
+      #
+      # sum(), NOT per-series: VictoriaLogs registers vl_rows_ingested_total
+      # per ingestion protocol (jsonline, elasticsearch, loki, syslog, …) and
+      # vector ships via jsonline only — every unused path sits at rate 0
+      # forever, so an unaggregated `== 0` fires permanently and trains the
+      # operator to ignore the one alert guarding the PHI audit pipeline.
+      - alert: LogIngestionStalled
+        expr: sum(rate(vl_rows_ingested_total[15m])) == 0 or absent(vl_rows_ingested_total)
+        # The staleness knob (was LOGS_MAX_AGE_MIN in the bash monitor's env).
+        for: {{ carlos_logs_max_age_min | default(30) }}m
+        annotations:
+          summary: >-
+            VictoriaLogs ingested NO log lines recently — the log pipeline is
+            running but not shipping; the WAF PHI audit trail is silently NOT
+            being persisted
+
+      # Warn before memory exhaustion. MemAvailable is the kernel's estimate
+      # of reclaimable memory; the default threshold is 8% for 10 minutes.
+      - alert: MemoryLowHost
+        expr: >-
+          100 * node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+          < {{ carlos_mem_min_avail_pct | default(8) }}
+        for: 10m
+        annotations:
+          summary: >-
+            host memory low: {{ '{{ $value | printf "%.0f" }}' }}% available
+            (floor {{ carlos_mem_min_avail_pct | default(8) }}%) — the next
+            large report or upgrade may be OOM-killed
+
+      # Sustained CPU saturation: load15 above 2x the core count for 30m is
+      # not a burst, it is an undersized or runaway host.
+      - alert: LoadHigh
+        expr: >-
+          node_load15
+          > {{ carlos_load15_per_core_max | default(2) }} * count without (cpu, mode)
+            (node_cpu_seconds_total{mode="idle"})
+        for: 30m
+        annotations:
+          summary: >-
+            host load15 {{ '{{ $value | printf "%.1f" }}' }} exceeds
+            {{ carlos_load15_per_core_max | default(2) }}x the core count for
+            30m — sustained CPU saturation

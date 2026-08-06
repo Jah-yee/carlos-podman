@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# vmagent scrape config for the carlos-app pod. vmagent runs in the app pod and
+# scrapes the mariadb + vmagent exporters over pod loopback, and node-exporter
+# (which now lives in the obs pod) cross-pod by pod name over carlos-net, then
+# remote-writes to the VictoriaMetrics store in the obs pod (the -remoteWrite.url
+# flag, set in the pod spec, buffers on the producer if the store is down).
+# Rendered per-instance by the carlos-podman Ansible role ({{ carlos_app_pod }}/{{ carlos_obs_pod }} = the pod names,
+# e.g. carlos-app/carlos-obs) so two groups on one host label their metrics
+# distinctly instead of both reporting "carlos-app"; add scrape jobs here as you
+# expose more metrics.
+global:
+  scrape_interval: 30s
+  external_labels:
+    instance: {{ carlos_app_pod }}
+
+scrape_configs:
+  # The exporter jobs (node/mariadb/vmagent self-metrics) deliberately stay
+  # credential-free: they are not the PHI stores, and adding auth there would
+  # require web-config machinery on each exporter for no boundary change.
+  - job_name: node
+    static_configs:
+      - targets: ['{{ carlos_obs_pod }}:9100']
+  - job_name: mariadb
+    static_configs:
+      - targets: ['127.0.0.1:9104']
+  - job_name: vmagent
+    static_configs:
+      - targets: ['127.0.0.1:8429']
+  # VictoriaLogs self-metrics, cross-pod: vmalert's LogIngestionStalled rule
+  # watches vl_rows_ingested_total — a running-but-non-shipping log pipeline
+  # must not die green (see vmalert-rules.yml.j2). This is the one job that
+  # crosses an AUTHED boundary; the password_file path rides the podman
+  # secret mount, so this 0644 file stays credential-free.
+  - job_name: victorialogs
+    static_configs:
+      - targets: ['{{ carlos_obs_pod }}:9428']
+{% if carlos_obs_http_auth | bool %}
+    basic_auth:
+{# Render the username as JSON because JSON strings are valid YAML scalars.
+   Keep this Jinja comment at column zero: with trim_blocks enabled, leading
+   whitespace before the marker can be joined to the following YAML line and
+   change its indentation. #}
+      username: {{ carlos_obs_http_user | to_json }}
+      password_file: /etc/obs-auth/password
+{% endif %}

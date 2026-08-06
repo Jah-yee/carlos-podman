@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Installed by the carlos-podman Ansible role to /etc/systemd/system/.
+[Unit]
+Description=CARLOS EMR health monitor every {{ carlos_monitor_oncalendar }}
+# Fire only after the first successful `carlos-ctl play` created the go-live
+# marker: the playbook enables these timers without starting them (they would
+# fail — and page — against a down stack), and without this gate a REBOOT in
+# the provision->first-play window (image builds and TLS certs routinely take
+# days) would start them anyway and resurrect the failure storm.
+ConditionPathExists={{ carlos_emr_home }}/container/.deployed
+
+[Timer]
+OnCalendar={{ carlos_monitor_oncalendar }}
+# No Persistent=true: a missed sub-hourly run is superseded almost
+# immediately, and a persistent catch-up fires at BOOT — before the
+# user-unit pods (which a system timer cannot order after) are up —
+# producing spurious pages on every reboot. The in-script boot grace
+# (BOOT_GRACE_SECONDS) covers a calendar fire landing in that window.
+# jitter so the 15-min monitor timers across instances/hosts do not synchronize.
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

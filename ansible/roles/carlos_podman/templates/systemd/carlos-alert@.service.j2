@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Installed by the carlos-podman Ansible role to /etc/systemd/system/.
+# Template unit: OnFailure={{ carlos_instance }}-alert@%n.service on the backup/binlog/verify
+# units runs this with the failed unit's name as the instance (%i).
+[Unit]
+Description=CARLOS EMR alert dispatch (%i)
+
+[Service]
+Type=oneshot
+# Type=oneshot defaults TimeoutStartSec to INFINITY. This is the ONE unit that
+# talks to a webhook/MTA — the classic hang source — so an unbounded start lets
+# a wedged smarthost (sendmail blocking on a dead SMTP connect) leave the alert
+# unit 'activating' forever: the page is never delivered AND never fails, so the
+# operator is silently un-paged for the very condition that triggered it. Cap it
+# so a stuck dispatch fails loudly instead. The webhook path is already curl
+# -m 15 bounded; this backstops the MTA path (see carlos_ctl/alert.py).
+TimeoutStartSec=2min
+# carlos-ctl reads the instance home from $EMR_HOME.
+Environment=EMR_HOME={{ carlos_emr_home }}
+ExecStart=/usr/local/sbin/carlos-ctl alert "%i"
+
+# Sandbox: the dispatcher only writes to the journal and talks to the
+# webhook/MTA. ProtectSystem=full (not strict): a sendmail-compatible MTA may
+# need to write its spool under /var.
+NoNewPrivileges=yes
+ProtectSystem=full
+# The throttle stamps live under EMR_HOME (default /usr/local/emr — inside
+# the /usr that ProtectSystem=full remounts read-only). Without this carve-out
+# the stamp write fails EROFS on every dispatch, the throttle never engages,
+# and a failing 15-minute timer pages ~96x/day instead of once per
+# ALERT_REMIND_HOURS window. The role pre-creates the directory.
+ReadWritePaths={{ carlos_emr_home }}/monitor/state
+PrivateTmp=yes

@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Root system unit installed by the carlos-podman Ansible role to {{ carlos_instance }}-nft.service.
+# Re-applies the nftables NAT redirect that lets end users reach the rootless
+# WAF on the privileged port: {{ carlos_bind_ip }}:{{ carlos_https_port }} -> :{{ carlos_https_publish_port }}.
+# nft rules do not survive a reboot, so this restores them at boot BEFORE the
+# service user's manager starts the WAF pod.
+[Unit]
+Description=CARLOS EMR {{ carlos_instance }} nftables 443->{{ carlos_https_publish_port }} redirect
+After=network-pre.target
+Wants=network-pre.target
+Before=user@{{ carlos_service_uid }}.service
+OnFailure={{ carlos_instance }}-alert@%n.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The retry loop below sleeps up to 3x5s; cap the unit so a wedged nft (netlink
+# hang) fails and pages via OnFailure instead of blocking boot indefinitely
+# (Before=user@<uid>.service means a hung apply would stall the pod manager).
+TimeoutStartSec=2min
+# Bounded in-line retry: systemd forbids Restart= on a RemainAfterExit oneshot,
+# so a transient boot-order failure (nftables backend not ready yet) gets three
+# attempts 5s apart before the unit fails and OnFailure= pages — without it a
+# single early failure left the front door down until a manual re-run.
+ExecStart=/bin/sh -c 'for i in 1 2 3; do /usr/sbin/nft -f {{ carlos_emr_home }}/container/{{ carlos_instance }}-nat.nft && exit 0; sleep 5; done; exit 1'
+# Tear the table down on stop (decommission / maintenance) so a stale redirect
+# does not outlive the deployment. `-` prefix: an absent table (stop after a
+# failed start, or a double stop) must not mark the unit failed — that would
+# fire OnFailure and page during routine decommission.
+ExecStop=-/usr/sbin/nft delete table ip {{ carlos_instance }}-nat
+# The log-view source filter rides in the same ruleset file (absent on a
+# loopback BIND_IP — hence also '-'-tolerant).
+ExecStop=-/usr/sbin/nft delete table inet {{ carlos_instance }}-filter
+# The host default-deny firewall (carlos_host_firewall_enabled) also rides in
+# the same ruleset file — tear it down on stop so a decommission does not leave
+# a stale host-global 'policy drop' input chain that would deny traffic (and
+# possibly SSH) with no CARLOS instance behind it. '-'-tolerant: absent when
+# the firewall was never enabled.
+ExecStop=-/usr/sbin/nft delete table inet {{ carlos_instance }}-hostfw
+
+# Sandbox: nft only reads the ruleset file and talks netlink — no filesystem
+# writes, no privilege re-escalation. (The timer-driven backup/monitor units
+# deliberately get NO NoNewPrivileges: their scripts runuser into the service
+# user, which NNP's setuid block would break.)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The rendered .nft ruleset lives under {{ carlos_emr_home }}; expose it read-only through
+# ProtectHome (required if EMR_HOME is placed under /home or /root).
+ReadOnlyPaths={{ carlos_emr_home }}
+
+[Install]
+WantedBy=multi-user.target

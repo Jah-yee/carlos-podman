@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# MariaDB client credentials for mysqld-exporter (mounted at
+# /etc/mysqld-exporter/.my.cnf, read via --config.my-cnf). mode 600.
+# FAIL-CLOSED: the playbook renders this with the `exporter` username and an
+# UNUSABLE placeholder password — never the db root password. `carlos-ctl
+# db-users` (run automatically by `play`) writes the real least-privilege
+# `exporter` credentials (PROCESS, REPLICATION CLIENT, and SELECT on
+# performance_schema only — no PHI table access). Until then the exporter
+# fails auth and the monitor's `mysql_up != 1` check alerts — far safer than
+# seeding the network-facing exporter uid with root DB credentials that a
+# skipped/failed provisioning step would leave in place.
+# NOTE: zz-carlos.cnf ships performance_schema=OFF, so the perf-schema grant
+# (and the exporter's perf-schema collectors) are inert until a site turns
+# P_S on — the grant is provisioned anyway so enabling P_S needs no re-grant.
+[client]
+user = exporter
+password = __UNPROVISIONED__
+host = 127.0.0.1
+port = 3306

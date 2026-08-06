@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Quadlet unit for the {{ carlos_waf_pod }} pod — a ROOTLESS USER unit installed by
+# the carlos-podman Ansible role to /etc/containers/systemd/users/<uid>/{{ carlos_waf_pod }}.kube, from
+# which the service user's `systemd --user` generates {{ carlos_waf_pod }}.service. The
+# internet-facing ModSecurity WAF, split out of the app pod so a WAF compromise
+# shares no network namespace with MariaDB. It publishes {{ carlos_https_publish_port }}
+# (>1024, bindable rootless); nftables redirects {{ carlos_https_port }} to it.
+#
+# No OnFailure={{ carlos_instance }}-alert@ — a user unit cannot trigger a system template
+# (the monitor's 15-min systemctl --user is-active check covers pod failure).
+[Unit]
+Description=CARLOS EMR edge pod (ModSecurity WAF)
+# network-online.target rarely exists in a `systemd --user` manager; when it
+# is absent these two lines are inert (missing Wants=/After= are ignored). A
+# boot race against interface/IP assignment is absorbed by Restart=on-failure.
+Wants=network-online.target
+After=network-online.target
+# Never give up permanently (StartLimitIntervalSec=0 disables the start-rate
+# limiter): a transient fault (network race, slow disk, OOM recovery) that
+# outlasts a burst budget would otherwise leave the EMR PERMANENTLY stopped
+# until a human intervenes, and the 15-min monitor sweep is the only detector.
+# RestartSec=30 below still paces the retries, so a genuine config error
+# (e.g. the documented innodb_page_size mismatch) loops calmly at 2/min
+# instead of thrashing.
+StartLimitIntervalSec=0
+# The app pod is this WAF's only backend: ordering, not a hard require —
+# the WAF can start and serve 502s while the app warms up.
+Wants={{ carlos_instance }}.service
+After={{ carlos_instance }}.service
+
+[Kube]
+Yaml={{ carlos_emr_home }}/container/{{ carlos_waf_pod }}.yaml
+# Ship the WAF access/error/audit streams via the host journal like the app pod.
+LogDriver=journald
+# Edge-only: reaches the app pod by name. Deliberately NOT on {{ carlos_net_name }} —
+# that would give the internet-facing WAF a path to the obs pod's
+# unauthenticated log/metric stores (PHI).
+Network={{ carlos_edge_net_name }}
+
+[Service]
+Restart=on-failure
+RestartSec=30
+# First start pulls the waf image.
+TimeoutStartSec=900
+
+[Install]
+# User-manager target (multi-user.target does not exist in `systemd --user`).
+WantedBy=default.target

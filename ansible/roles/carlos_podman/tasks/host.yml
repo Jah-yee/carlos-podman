@@ -1,0 +1,379 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# HOST base setup (the bash cmd_init): prerequisite checks, the rootless
+# engine owner, and persistent journald. Touches no instance state;
+# idempotent and safe with instances running.
+---
+- name: Required host tools are present (fail-fast with the missing piece named)
+  # command -v is a shell builtin, so this needs the shell module.
+  ansible.builtin.shell: "command -v {{ item }}"  # noqa command-instead-of-shell
+  changed_when: false
+  failed_when: false
+  # Read-only probe: MUST run in --check too, or the assert below trips over
+  # an undefined rc and the documented `--check --diff` drift review aborts.
+  check_mode: false
+  register: _tool_probe
+  # curl + openssl are load-bearing, not optional: the entire paging path
+  # (webhook dispatch AND the off-host heartbeat) is curl-gated, and the
+  # monitor's TLS-expiry checks need openssl. A curl-less host cannot even
+  # deliver the "curl is missing" alert (it rides the webhook), so the
+  # failure self-conceals — assert them up front.
+  loop: [runuser, loginctl, nft, newuidmap, podman, systemctl, curl, openssl]
+
+- name: Fail on missing prerequisites
+  ansible.builtin.assert:
+    that: item.rc == 0
+    fail_msg: >-
+      '{{ item.item }}' not found on {{ inventory_hostname }} — required by
+      the rootless engine / redirect / unit management (install it first)
+  loop: "{{ _tool_probe.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: sops + age are present (the single-master secrets backend needs them at seal time)
+  ansible.builtin.shell: "command -v {{ item }}"  # noqa command-instead-of-shell
+  changed_when: false
+  failed_when: false
+  check_mode: false  # read-only probe — see the tool probe above
+  register: _sops_probe
+  loop: [sops, age, age-keygen]
+  # Advisory only — the hard requirement is enforced by `carlos-ctl seal`.
+
+- name: Warn when sops/age are absent
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: '{{ item.item }}' not found — 'carlos-ctl seal' (single-master
+      secret encryption) will require it
+  loop: "{{ _sops_probe.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc | default(0) != 0
+
+- name: Ensure /var/lib/cni exists (podman's rootless netns masks its nearest existing parent)
+  # podman's rootless network namespace bind-mounts an EMPTY scratch dir over
+  # the CNI state directory, and it walks UP from /var/lib/cni to the first
+  # path that EXISTS (libpod comment: "if /var/lib/cni does not exist, use the
+  # parent dir"). On a netavark-only host nothing creates /var/lib/cni — the
+  # containernetworking-plugins package ships binaries to /usr/lib/cni and the
+  # state dir is made lazily by CNI itself — so the walk lands on **/var/lib**
+  # and masks the whole thing. Anything of podman's under there, in particular
+  # a graphroot (netavark reads its network definitions from
+  # <graphroot>/networks), becomes INVISIBLE inside the very namespace that has
+  # to resolve them: every named bridge network fails with "unable to find
+  # network with name or ID <net>: network not found" while `podman network ls`
+  # on the host lists it happily, and `carlos-ctl play` aborts on its first
+  # `kube play`.
+  #
+  # Measured on podman 4.9.3 (the documented floor), two pristine service
+  # accounts differing ONLY in home location: /var/opt worked, /var/lib failed,
+  # and creating this directory flipped the failing one to working.
+  #
+  # VERSION SCOPE: unconditional in podman 4.x (any backend). podman 5 moved
+  # the code to containers/common and gated it on `n.backend == CNI`, so
+  # netavark installs there are unaffected. The /run mask is unconditional in
+  # BOTH — which is why /run is refused outright and this directory is only
+  # needed for the /var/lib case.
+  #
+  # This deployment keeps its engine store outside /var/lib anyway
+  # (carlos_service_user_home), so this is defence in depth: it costs one empty
+  # root-owned directory and makes a site that points the store there — via
+  # carlos_service_user_home or its own storage.conf — work instead of failing
+  # in a way that blames the network.
+  ansible.builtin.file:
+    path: /var/lib/cni
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  throttle: 1
+
+- name: Read the service account (a home change would orphan the engine store)
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ carlos_service_user }}"
+  # No register: getent sets the getent_passwd FACT, which is what the assert
+  # below reads. failed_when:false so a not-yet-created account is not an error.
+  failed_when: false
+  check_mode: false
+
+- name: Refuse to silently relocate an existing account's home
+  # `ansible.builtin.user` rewrites /etc/passwd but does NOT move the directory
+  # without move_home, so changing carlos_service_user_home on a provisioned
+  # host would repoint podman at an empty graphroot and orphan the (multi-GB)
+  # image store, plus the podman secret store — whose file driver records
+  # ABSOLUTE paths in secrets.json that nothing relocates. That surfaces later
+  # as "image not found" at the next play, or as `mkdir <old home>: permission
+  # denied` on every secret operation. Deliberately NOT automated: moving a
+  # live engine store needs the instance stopped, and the operator is better
+  # placed to decide when. Refuse with the recipe instead.
+  vars:
+    _old_home: >-
+      {{ ((getent_passwd | default({}))[carlos_service_user]
+          | default(['', '', '', '', '', '']))[4] }}
+  ansible.builtin.assert:
+    that: _old_home in ['', carlos_service_user_home]
+    fail_msg: >-
+      the service account '{{ carlos_service_user }}' already exists with home
+      '{{ _old_home }}', but carlos_service_user_home is
+      '{{ carlos_service_user_home }}'. Applying that would repoint podman at an
+      empty graphroot and orphan the image store (and the podman secret store,
+      whose paths are absolute). The mismatch can come from a host_vars override
+      OR from a newer role revision changing the default — either way, to KEEP
+      the existing layout set carlos_service_user_home: '{{ _old_home }}' in
+      host_vars (safe: the /var/lib/cni task above keeps a /var/lib home clear
+      of podman's rootless-netns mask), or move it deliberately with the
+      instance stopped:
+      `carlos-ctl down` (every instance sharing this service user), kill any
+      surviving podman pause/catatonit helpers
+      (`pgrep -a -u {{ carlos_service_user }}`),
+      `usermod -d {{ carlos_service_user_home }} -m {{ carlos_service_user }}`,
+      repoint the absolute paths in
+      {{ carlos_service_user_home }}/.local/share/containers/storage/secrets/secrets.json,
+      `runuser -u {{ carlos_service_user }} -- podman system migrate`,
+      then re-run this playbook.
+  when: (getent_passwd | default({}))[carlos_service_user] is defined
+
+- name: Create the rootless engine owner (system account, nologin)
+  ansible.builtin.user:
+    name: "{{ carlos_service_user }}"
+    system: true
+    create_home: true
+    # NOT /var/lib/<user>, the otherwise-canonical system-account home: this
+    # directory is the parent of podman's GRAPHROOT
+    # ($HOME/.local/share/containers/storage), and podman's rootless network
+    # namespace masks /var/lib (see the task above) and /run (always). Keeping
+    # the store out of both is the primary guard; the /var/lib/cni directory
+    # above is the backstop. `carlos-ctl play` re-checks the LIVE graphroot,
+    # which also covers a site-supplied storage.conf that moves it.
+    home: "{{ carlos_service_user_home }}"
+    shell: /usr/sbin/nologin
+  # HOST-GLOBAL: on a multi-instance host every inventory entry shares this
+  # service user. throttle:1 serializes it across the batch so two parallel
+  # instance runs don't race useradd on the same name.
+  throttle: 1
+
+- name: Read existing subuid grants
+  ansible.builtin.slurp:
+    src: /etc/subuid
+  register: _subuid_file
+  failed_when: false
+
+- name: Grant a 65536-wide subuid/subgid range (useradd -r allocates NONE)
+  # Next free range at/above 100000 scanned across BOTH subuid and subgid —
+  # the same range is granted as subuids AND subgids, so a subgid-only
+  # allocation for another user must also push the base up.
+  #
+  # HOST-GLOBAL critical section: /etc/subuid + /etc/subgid are shared files.
+  # Two parallel instance runs (or an unrelated usermod) could each read the
+  # same `base`, then both write the SAME range — a double allocation that
+  # breaks the rootless uid mapping. flock on /etc/subuid serializes the
+  # read-decide-write against ANY writer (Ansible batch or not); throttle:1 is
+  # the belt to flock's suspenders across this play's own hosts. shadow < 4.9
+  # (Ubuntu jammy) has no `usermod --add-subuids`, so fall back to appending
+  # the grant lines directly under the same lock.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    exec 9>/etc/subuid.carlos.lock
+    flock 9
+    # Re-check INSIDE the lock: the `when` guard below reads a slurp taken
+    # before any host's grant task ran, so on a fresh machine with two
+    # instance entries (linear strategy runs all slurps first) the second
+    # host's guard still sees the pre-grant file and would append a SECOND
+    # 65536 range for the same user. The lock-held grep is the authoritative
+    # read-decide-write; the `when` is now only a fast path.
+    if grep -q "^{{ carlos_service_user }}:" /etc/subuid 2>/dev/null; then
+        exit 0
+    fi
+    base=100000
+    while read -r _ start count; do
+        case "$start$count" in *[!0-9]*|"") continue ;; esac
+        if [ $((start + count)) -gt "$base" ]; then base=$((start + count)); fi
+    done <<EOF
+    $(awk -F: '{print $1, $2, $3}' /etc/subuid /etc/subgid 2>/dev/null)
+    EOF
+    range="$base-$((base + 65535))"
+    if usermod --help 2>&1 | grep -q -- --add-subuids; then
+        usermod --add-subuids "$range" --add-subgids "$range" "{{ carlos_service_user }}"
+    else
+        # shadow < 4.9: no --add-subuids. Append the grants directly (the
+        # in-lock grep above established the user has no existing line).
+        printf '%s:%s:65536\n' "{{ carlos_service_user }}" "$base" >> /etc/subuid
+        printf '%s:%s:65536\n' "{{ carlos_service_user }}" "$base" >> /etc/subgid
+    fi
+    echo granted
+  args:
+    executable: /bin/bash
+  register: _subuid_grant
+  throttle: 1
+  # Anchored line-start regex, NOT a substring: 'carlos:' as a substring also
+  # matches a neighboring 'xcarlos:100000:65536' line, which would silently
+  # SKIP the grant for the real user (broken rootless uid mapping at the
+  # first podman call).
+  when: >-
+    (_subuid_file.content is not defined) or
+    not ((_subuid_file.content | b64decode)
+         is search('(?m)^' ~ (carlos_service_user | regex_escape) ~ ':'))
+  changed_when: "'granted' in _subuid_grant.stdout | default('')"
+
+# The grant above is SKIPPED whenever the user already has any subuid line,
+# however narrow — a pre-existing account, a site allocation, or a
+# hand-edited /etc/subuid keeps its width and nothing downstream checks it.
+# Rootless podman builds the userns map from the FIRST grant only (measured:
+# grants 165536:34464 + 200000:65536 map just 34464 ids), so a narrow one
+# leaves container id 65534 unmapped, and every consumer of it fails
+# somewhere that names a different cause: `podman unshare chown 65534:65534`
+# on the mysqld-exporter my.cnf returns EINVAL (metrics silently missing),
+# and the image builds die in the runtime stage on apt's
+# "setgroups 65534 failed - setgroups (22: Invalid argument)". Assert the
+# width here, where the role owns the allocation and can name the remedy.
+- name: Re-read the subuid/subgid grants (the grant task may have just written them)
+  ansible.builtin.slurp:
+    src: "/etc/{{ item }}"
+  register: _subid_files
+  failed_when: false
+  loop: [subuid, subgid]
+
+- name: The service user's FIRST subuid/subgid grant maps every pinned container id
+  vars:
+    # First matching line's third field (the count), or 0 when absent — an
+    # absent grant is the grant task's job, not this assert's.
+    _width: >-
+      {{ ((item.content | default('') | b64decode).splitlines()
+          | select('match', '^' ~ (carlos_service_user | regex_escape) ~ ':')
+          | list | first | default('::0')).split(':')[2] | int }}
+  ansible.builtin.assert:
+    that: "_width | int == 0 or _width | int >= 65534"
+    fail_msg: >-
+      /etc/{{ item.item }}: the first grant for '{{ carlos_service_user }}' maps
+      only {{ _width }} sub-ids, but the pods and the image builds pin container
+      id 65534 (mysqld-exporter; apt inside the builds). Rootless podman maps
+      from the FIRST grant only, so appending another range does not help —
+      WIDEN the existing one to at least 65536
+      (usermod --del-sub{{ 'uid' if item.item == 'subuid' else 'gid' }}s <old>
+      --add-sub{{ 'uid' if item.item == 'subuid' else 'gid' }}s <base>-<base+65535>
+      {{ carlos_service_user }}), then run
+      'runuser -u {{ carlos_service_user }} -- podman system migrate'.
+  loop: "{{ _subid_files.results | default([]) }}"
+  loop_control:
+    label: "/etc/{{ item.item }}"
+  when: item.content is defined
+
+- name: Enable login lingering (systemd --user manager + XDG_RUNTIME_DIR from boot)
+  ansible.builtin.command: "loginctl enable-linger {{ carlos_service_user }}"
+  args:
+    creates: "/var/lib/systemd/linger/{{ carlos_service_user }}"
+
+- name: Resolve the service user's uid (unit templates need it)
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ carlos_service_user }}"
+  register: _service_user_getent
+  # In --check on a FRESH host the user task above did not actually create the
+  # account, so the lookup legitimately finds nothing — tolerate that ONLY in
+  # check mode (the drift review must be able to complete); a real run still
+  # fails loudly here if user creation somehow did not stick.
+  failed_when: _service_user_getent is failed and not ansible_check_mode
+
+- name: Record carlos_service_uid
+  ansible.builtin.set_fact:
+    # The '0' fallback only ever applies in --check on a fresh host (see
+    # above) — it keeps downstream templates renderable for the diff preview.
+    carlos_service_uid: >-
+      {{ ((getent_passwd | default({}))[carlos_service_user]
+          | default(['x', '0']))[1] }}
+
+- name: Wait for the lingering user manager's runtime dir
+  # Lingering starts user@<uid>.service asynchronously; everything pod-facing
+  # needs its runtime dir, so wait briefly for it.
+  ansible.builtin.wait_for:
+    path: "/run/user/{{ carlos_service_uid }}"
+    timeout: 20
+  register: _carlos_runtime_dir
+  # ignore_errors (NOT failed_when:false): failed_when rewrites the result's
+  # failed flag, which made the assert below vacuous — `is not failed` could
+  # never fire. ignore_errors preserves the failure for the assert while
+  # letting the play reach its clearer message.
+  ignore_errors: true
+  # Skipped in --check on a fresh host: linger was not actually enabled above,
+  # so the 20s wait would only stall the drift review to report a
+  # by-construction absence.
+  when: not ansible_check_mode
+
+- name: Fail clearly if the runtime dir never appeared (lingering/user manager)
+  # Don't swallow the wait_for failure: if /run/user/<uid> never shows up, a
+  # later pod-facing task fails with a far more opaque error. Point at the
+  # actual root cause instead.
+  ansible.builtin.assert:
+    that: _carlos_runtime_dir is not failed
+    fail_msg: >-
+      /run/user/{{ carlos_service_uid }} did not appear within 20s — lingering
+      for '{{ carlos_service_user }}' did not start its systemd --user manager.
+      Check 'loginctl user-status {{ carlos_service_user }}' and
+      'systemctl status user@{{ carlos_service_uid }}.service'; rootless podman
+      cannot run without this runtime dir.
+
+- name: Enable persistent journald storage
+  # The log collector tails the host's PERSISTENT journal, and the podman
+  # journald log driver needs somewhere durable to write — a volatile /run
+  # journal is lost on reboot and cannot back a restart-time backfill.
+  # systemd auto-switches to persistent storage when /var/log/journal exists.
+  ansible.builtin.file:
+    path: "{{ carlos_journal_dir }}"
+    state: directory
+    # 2755, not 0755: /var/log/journal is canonically drwxr-sr-x (setgid) so
+    # systemd-journal-group members keep read access. Forcing 0755 stripped the
+    # setgid bit AND, because systemd re-applies 2755, made every subsequent
+    # run see 2755 != 0755 — rewriting it and restarting journald on EVERY run
+    # (a permanent idempotency violation). Group is left to systemd (tmpfiles
+    # sets systemd-journal) so this task never fights it.
+    mode: "2755"
+  register: _journal_dir
+
+- name: Ensure the journald drop-in dir exists
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    mode: "0755"
+  when: carlos_journald_max_use | default('') | length > 0
+
+- name: Bound the persistent journal (SystemMaxUse drop-in)
+  # The app/db/waf streams all land in the persistent journal (PHI-adjacent)
+  # and, when the obs pod is off, the journal is the ONLY log copy — so its
+  # size ceiling is both a disk-safety and a retention decision. A drop-in
+  # (not editing journald.conf) survives distro upgrades. NOTE for existing
+  # hosts: the default applies on the next playbook run and journald will
+  # vacuum down to it — raise carlos_journald_max_use first if the current
+  # journal is a retention copy you need.
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/carlos-max-use.conf
+    mode: "0644"
+    content: |
+      # Installed by the carlos-podman Ansible role (carlos_journald_max_use).
+      [Journal]
+      SystemMaxUse={{ carlos_journald_max_use }}
+  register: _journal_maxuse
+  when: carlos_journald_max_use | default('') | length > 0
+
+- name: Remove the journal bound when unset (back to the host's own policy)
+  # carlos_journald_max_use: "" must actually RESTORE host policy, not just
+  # stop managing a previously-installed drop-in.
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d/carlos-max-use.conf
+    state: absent
+  register: _journal_maxuse_rm
+  when: carlos_journald_max_use | default('') | length == 0
+
+- name: Restart journald to adopt persistent storage / the size bound
+  ansible.builtin.systemd:
+    name: systemd-journald
+    state: restarted
+  when: >-
+    _journal_dir.changed
+    or (_journal_maxuse is defined and _journal_maxuse.changed | default(false))
+    or (_journal_maxuse_rm is defined and _journal_maxuse_rm.changed | default(false))
+  # In --check the drop-in/dir were not actually written, so querying/starting
+  # the service can only report on a state this run never created — tolerate
+  # module failures THERE ONLY (systemd-less CI containers included); a real
+  # run still fails loudly.
+  ignore_errors: "{{ ansible_check_mode }}"
+  # noqa no-handler — one-shot adoption, not config reload

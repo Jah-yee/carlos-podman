@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 CARLOS Contributors -->
+<!-- Tomcat context configuration for the CARLOS app container. Installed by
+     carlos-ctl to $EMR_HOME/container/conf/tomcat/ and mounted read-only over
+     /usr/local/tomcat/conf/context.xml (also baked into the image as a
+     standalone-run default).
+
+     CookieProcessor sameSiteCookies="lax": stamps SameSite=Lax on the session
+     cookie so cross-site POSTs cannot ride an authenticated session (CSRF
+     defense-in-depth alongside the app's CSRFGuard). "lax" — not "strict" —
+     because the EMR's login redirects and popup flows must keep the session
+     on top-level navigations. -->
+<Context>
+    <WatchedResource>WEB-INF/web.xml</WatchedResource>
+    <WatchedResource>WEB-INF/tomcat-web.xml</WatchedResource>
+    <WatchedResource>${catalina.base}/conf/web.xml</WatchedResource>
+    <CookieProcessor sameSiteCookies="lax"/>
+</Context>

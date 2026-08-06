@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Derived identity — everything host-global derives from carlos_instance so a
+# second pod-group coexists on one host with distinct names (same derivation
+# as carlos_ctl/config.py; do not override these per host).
+---
+carlos_app_pod: "{{ carlos_instance }}-app"
+carlos_obs_pod: "{{ carlos_instance }}-obs"
+carlos_waf_pod: "{{ carlos_instance }}-waf"
+carlos_net_name: "{{ carlos_instance }}-net"
+carlos_edge_net_name: "{{ carlos_instance }}-edge"
+carlos_db_secret: "{{ carlos_instance }}-db"
+carlos_conf_dir: "{{ carlos_emr_home }}/container/conf"
+carlos_data_dir: "{{ carlos_emr_home }}/data"
+carlos_db_socket_dir: "{{ carlos_emr_home }}/run/db-socket"
+carlos_run_secrets_dir: "/run/{{ carlos_instance }}-emr"
+carlos_secrets_dir: "{{ carlos_conf_dir }}/secrets"
+carlos_secrets_bundle: "{{ carlos_secrets_dir }}/secrets.enc.yaml"
+carlos_secrets_private_dir: "{{ carlos_emr_home }}/secrets-private"
+carlos_age_key_file: "{{ carlos_secrets_private_dir }}/age-key.txt"
+carlos_age_pub_file: "{{ carlos_secrets_dir }}/age-recipient.pub"
+carlos_cred_age: "{{ carlos_instance }}-age"
+# Legacy per-fragment blob names — referenced only by seal's migration reader.
+carlos_cred_restic: "{{ carlos_instance }}-restic"
+carlos_cred_backup_db: "{{ carlos_instance }}-backup-db"
+carlos_cred_db_fragment: "{{ carlos_instance }}-db-fragment"
+carlos_cred_drugref_fragment: "{{ carlos_instance }}-drugref-db-fragment"

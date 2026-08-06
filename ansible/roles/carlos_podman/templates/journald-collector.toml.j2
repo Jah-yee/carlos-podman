@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Single log collector for the carlos deployment (obs-pod `logcollect`
+# container). Reads the HOST systemd journal — into which podman's journald log
+# driver writes every app-pod container's stdout/stderr — and ships to the
+# in-pod VictoriaLogs store.
+#
+# Durability / backfill: the journald source checkpoints its cursor, and the
+# HTTP sink uses an on-disk buffer with end-to-end acknowledgements, so the
+# cursor only advances after VictoriaLogs accepts a batch. If VictoriaLogs is
+# down the sink retries and the cursor holds; when it returns the collector
+# backfills every missed line, bounded only by the host journal's retention
+# (journald SystemMaxUse). This is strictly more durable than the previous
+# in-memory per-producer buffer, which dropped on a hard crash or when full.
+
+# Persisted (hostPath) so the cursor + disk buffer survive a collector restart.
+data_dir = "/var/lib/vector"
+
+[sources.journald]
+type = "journald"
+journal_directory = "/var/log/journal"
+# current_boot_only is deliberately NOT set to false: vector 0.56 hard-rejects
+# `current_boot_only = false` when the bundled journalctl is systemd 250-257
+# (i.e. every current distro), so the collector would never start. The
+# checkpoint cursor in data_dir already carries ingestion across restarts and
+# reboots within the current-boot stream; only lines logged BETWEEN the last
+# pre-reboot checkpoint and the reboot itself are not re-read on the new boot,
+# bounded by the collector's shutdown flush. Revisit if vector re-allows
+# cross-boot reads on current systemd.
+
+# Keep only THIS group's app-pod and waf-pod container logs (podman's journald
+# driver sets CONTAINER_NAME to <pod>-<container>). Host units, the obs pod's
+# own containers, and any OTHER group's containers on the shared host journal
+# are ignored — the pod-name prefixes are instance-scoped so two groups'
+# collectors never cross-ship, and matching only these prefixes avoids
+# collector self-feedback.
+[transforms.only_containers]
+type = "filter"
+inputs = ["journald"]
+condition = 'exists(.CONTAINER_NAME) && (starts_with(to_string(.CONTAINER_NAME) ?? "", "{{ carlos_app_pod }}-") || starts_with(to_string(.CONTAINER_NAME) ?? "", "{{ carlos_waf_pod }}-"))'
+
+# Derive the VictoriaLogs stream name from the container name (strip the
+# pod-name prefix). The waf container — now in its own {{ carlos_waf_pod }} pod —
+# multiplexes access + error on stdout/stderr, so split it by journal
+# PRIORITY (<=4 error, else access); the stream names stay waf-access /
+# waf-error exactly as before the pod split.
+[transforms.tag]
+type = "remap"
+inputs = ["only_containers"]
+source = '''
+name = replace(to_string(.CONTAINER_NAME) ?? "unknown", r'^({{ carlos_app_pod }}|{{ carlos_waf_pod }})-', "")
+if name == "waf" {
+    prio = to_int(.PRIORITY) ?? 6
+    .stream = if prio <= 4 { "waf-error" } else { "waf-access" }
+} else {
+    .stream = name
+}
+'''
+
+# PHI redaction on ALL shipped streams (not just waf-*): mask 9+-digit runs
+# (health-card/phone numbers) AND separator-formatted identifiers — a 10-digit
+# Ontario HIN is routinely written 1234-567-890 and a SIN 123-456-789, neither
+# of which contains a 9-digit run, so the contiguous pattern alone let them
+# through. Applied to app/db/drugref too: their stack traces and SQL errors
+# carry HIN/names/demographic_no into the {{ carlos_log_retention }} store, so
+# scoping redaction to the WAF left the exact same PHI exposed on the busier
+# streams. The UNREDACTED copy stays in the host journal for break-glass
+# debugging (this transform is collector-side, before the shipped store only).
+# Plus query-param masking for the PHI-CORRELATING identifiers that ride URLs
+# in the WAF access log (demographic_no/demoNo/patientId/appointment_no=...).
+# Epoch timestamps inside the ModSec JSON get masked too — cosmetic;
+# VictoriaLogs uses journal time. (ISO dates like 2026-07-08 survive the
+# separator pattern: the final group needs 3-4 digits, which a 2-digit day
+# never has. Bare 5-6 digit demographic_no values are deliberately NOT
+# blanket-masked — too collision-prone with benign ids/line numbers — only
+# masked when they appear as a named query param, below.)
+[transforms.redact]
+type = "remap"
+inputs = ["tag"]
+source = '''
+.message = replace(to_string(.message) ?? "", r'\d{9,}', "[REDACTED-NUM]")
+.message = replace(to_string(.message), r'\d{3,4}[- ]\d{2,3}[- ]\d{3,4}', "[REDACTED-NUM]")
+.message = replace(to_string(.message), r'(?i)(demographic_no|demono|patient_?id|appointment_no|billing_no)=\d+', "$$1=[REDACTED-ID]")
+'''
+
+[sinks.victorialogs]
+type = "http"
+inputs = ["redact"]
+uri = "http://127.0.0.1:9428/insert/jsonline?_stream_fields=stream&_msg_field=message&_time_field=timestamp"
+encoding.codec = "json"
+framing.method = "newline_delimited"
+healthcheck.enabled = false
+{% if carlos_obs_http_auth | bool %}
+# Vector's HTTP sink does not support a password file, so this generated file
+# contains the store credential and is installed with mode 0600. Vector expands
+# environment references before parsing TOML, including references in comments.
+# Double literal dollar signs and escape backslashes and quotes so operator-set
+# credentials remain valid TOML strings.
+auth.strategy = "basic"
+auth.user = "{{ carlos_obs_http_user | replace('\\', '\\\\') | replace('"', '\\"') | replace('$', '$$') }}"
+auth.password = "{{ carlos_obs_http_password_effective | replace('\\', '\\\\') | replace('"', '\\"') | replace('$', '$$') }}"
+{% endif %}
+# The queue: on-disk, retried until VictoriaLogs accepts (backfill guarantee).
+buffer.type = "disk"
+buffer.max_size = 536870912          # 512 MiB
+buffer.when_full = "block"
+request.retry_attempts = 100000000
+acknowledgements.enabled = true

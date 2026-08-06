@@ -1,0 +1,302 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for podman — records every invocation (and any stdin, e.g. the
+# SQL fed to `podman exec` or manifests fed to `kube play`) into $STUBLOG
+# and fakes just enough behavior for tests/run-tests.sh:
+#   STUB_PS                 newline-separated container names `ps --format` reports
+#   STUB_HASH_TAG           marker embedded in the fake bcrypt hash (default: init)
+#   STUB_SECRET_RM_RC       exit code for `secret rm` (default 0 = removable)
+#   STUB_SQL_FAIL           fail the bare `mariadb -uroot` provisioning exec
+#   STUB_DB_DOWN            fail the in-pod 3306 liveness probe
+#   STUB_REAUTH_FAIL        fail the post-provisioning `SELECT 1` re-auth probes
+#                           (non-root only, so the readiness probe still passes)
+#   STUB_RESTIC_VERIFY_FAIL fail `cat config` when the NEW password is forwarded
+#   STUB_LS_EMPTY           make `restic ls latest` print nothing (empty snapshot)
+#   STUB_RESTIC_CAT_RC      exit code for `restic cat config` (init-guard tests)
+#   STUB_DUMP_SOURCE_ANCHOR emit the newer CHANGE REPLICATION SOURCE TO anchor
+#   STUB_RESTORE_BINLOGS    materialize a fake binlog chain on `restic restore`
+#                           so the live restore's PITR replay branch runs
+#   STUB_NONINNODB          report a MyISAM table for the engine-audit query
+#   STUB_ROURKE_ARIA        report the KNOWN-unconvertible formRourke2009 (Aria)
+LOG="${STUBLOG:-/dev/null}"
+echo "podman $*" >> "$LOG"
+# Version floor probes (asserts.yml + carlos-ctl check): report a modern
+# runtime so the documented podman >= 4.9 floor passes under the harness.
+if [[ "$1" == "--version" ]]; then echo "podman version 5.2.0"; exit 0; fi
+# When a secret is forwarded by NAME (`-e MYSQL_PWD` / `-e RESTIC_PASSWORD`
+# with no =value) — the off-argv pattern the scripts use so the plaintext
+# never appears in the host process list — record the resolved value from
+# podman's own environment so tests can still assert the value reached the
+# container without it ever being an argv token.
+if [[ " $* " == *" -e MYSQL_PWD "* ]]; then
+    echo "forwarded-env MYSQL_PWD=${MYSQL_PWD:-}" >> "$LOG"
+fi
+if [[ " $* " == *" -e RESTIC_PASSWORD "* ]]; then
+    echo "forwarded-env RESTIC_PASSWORD=${RESTIC_PASSWORD:-}" >> "$LOG"
+fi
+# Simulate the provisioning SQL step failing mid-run (STUB_SQL_FAIL): only the
+# bare `mariadb -uroot` root-shell exec (SQL fed on stdin) fails; probes with
+# explicit `-e <query>` argv still succeed, so db-readiness passes first.
+if [[ -n "${STUB_SQL_FAIL:-}" && "$*" == *"mariadb -uroot" ]]; then
+    { echo "--- exec stdin (STUB_SQL_FAIL):"; [ ! -t 0 ] && cat; } >> "$LOG"
+    exit 1
+fi
+# Simulate the freshly-provisioned accounts failing to authenticate: the
+# non-root `SELECT 1` re-auth probes fail while the -uroot readiness probe
+# keeps passing.
+if [[ -n "${STUB_REAUTH_FAIL:-}" && "$*" == *"-e SELECT 1"* && "$*" != *"-uroot"* ]]; then
+    exit 1
+fi
+# Simulate the db server not accepting connections (monitor's authoritative
+# DB-liveness probe) when STUB_DB_DOWN is set.
+if [[ -n "${STUB_DB_DOWN:-}" && "$*" == *"/dev/tcp/127.0.0.1/3306"* ]]; then exit 1; fi
+# Simulate a failed `podman tag` (build's :previous rollback-tag guard).
+if [[ -n "${STUB_TAG_FAIL:-}" && "$1" == tag ]]; then exit 1; fi
+# Simulate a failed `podman pull` (play --pull stale-image gate).
+if [[ -n "${STUB_PULL_FAIL:-}" && "$1" == pull ]]; then exit 1; fi
+# `podman top <ctr> user` (check's non-root probe): print a header + a non-root
+# user row so the probe reports "runs non-root". STUB_TOP_EMPTY=1 prints only
+# the header (probe-returned-nothing path); STUB_TOP_ROOT=1 reports a root row.
+if [[ "$1" == top ]]; then
+    echo "USER"
+    if [[ -n "${STUB_TOP_ROOT:-}" ]]; then echo "root"
+    elif [[ -z "${STUB_TOP_EMPTY:-}" ]]; then echo "mysql"; fi
+    exit 0
+fi
+# Simulate WAF/DB isolation (check's /dev/tcp probes from the waf container):
+# 3306 by any NON-loopback host is refused (bind_address=127.0.0.1); the
+# unauthenticated log store :9428 is refused from the waf (edge-net-only —
+# check asserts the failure); 8080 by pod name succeeds (falls through to the
+# default exit 0).
+if [[ "$*" == *"/dev/tcp/"*"/3306"* && "$*" != *"/dev/tcp/127.0.0.1/3306"* ]]; then exit 1; fi
+if [[ "$*" == *"/dev/tcp/"*"/9428"* ]]; then exit 1; fi
+# TLS backend hop: cross-pod plaintext 8080 is loopback-pinned in server.xml,
+# so the waf-side probe must be REFUSED; the 8443 TLS backend probe falls
+# through to the default exit 0 (reachable).
+if [[ "$*" == *"/dev/tcp/"*"/8080"* && "$*" != *"/dev/tcp/127.0.0.1/8080"* ]]; then exit 1; fi
+case "$1 $2" in
+  # check's inspect probes: report the log driver / read-only flag the specs
+  # declare, so the hermetic suite can assert the corresponding ok lines.
+  "inspect "*)
+      case "$*" in
+        *ReadonlyRootfs*) echo true;;
+        *LogConfig.Type*) echo journald;;
+        # Combined Id+RestartCount (pass-8 N2 recreate detection). MUST stay
+        # before the bare *RestartCount* branch — the combined format string
+        # also contains "RestartCount" and first match wins.
+        *"{{.Id}} {{.RestartCount}}"*) echo "${STUB_CTR_ID:-deadbeef} ${STUB_RESTARTS:-0}";;
+        *RestartCount*)   echo "${STUB_RESTARTS:-0}";;
+        # play's post-start readiness gate polls the app container's health
+        # verdict; default healthy so the suite exercises the ready path,
+        # STUB_HEALTH=starting (with READY_WAIT_SECONDS=0) drives the
+        # timeout. ${VAR-default} (no colon) on purpose: STUB_HEALTH= set
+        # EMPTY drives the empty-status path, unset still means healthy.
+        *Health.Status*)  echo "${STUB_HEALTH-healthy}";;
+        # Empty-status follow-up: the gate passes an empty Health.Status only
+        # after confirming NO healthcheck is configured. Default: none;
+        # STUB_HEALTHCHECK_CONFIGURED=configured drives the
+        # wired-but-unreported (keep-polling) path.
+        *Config.Healthcheck*) echo "${STUB_HEALTHCHECK_CONFIGURED:-}";;
+      esac;;
+  "pod exists") exit 1;;
+  "image exists")
+      # Rollback guard: STUB_NO_DRUGREF_PREV makes only the drugref :previous
+      # image absent (carlos :previous still present), so the lockstep check
+      # can be exercised. Everything else "exists".
+      if [[ -n "${STUB_NO_DRUGREF_PREV:-}" && "$*" == *drugref*:previous* ]]; then exit 1; fi
+      exit 0;;
+  "secret exists") exit 0;;
+  "secret rm") exit "${STUB_SECRET_RM_RC:-0}";;
+  "kube play") { echo "--- kube play stdin:"; cat; } >> "$LOG";;
+  "pod ps"|"ps --pod") echo "[stub] $*";;
+  "ps --filter")
+      # `ps --filter health=unhealthy --format ...` (monitor health sweep):
+      # report the names in STUB_UNHEALTHY. Any other filtered ps: STUB_PS.
+      if [[ "$*" == *health=unhealthy* ]]; then printf '%s\n' ${STUB_UNHEALTHY:-};
+      else printf '%s\n' ${STUB_PS:-}; fi;;
+  "ps --format") printf '%s\n' ${STUB_PS:-};;
+  "run --rm")
+      # play's pre-cutover smoke (`--entrypoint /bin/true <image>`):
+      # STUB_SMOKE_FAIL models an image that cannot start at all.
+      if [[ "$*" == *"--entrypoint /bin/true"* ]]; then
+          [[ -n "${STUB_SMOKE_FAIL:-}" ]] && exit 125
+          exit 0
+      fi
+      if [[ "$*" == *hash-password* ]]; then
+          echo "\$2a\$14\$stub${STUB_HASH_TAG:-init}stubstubstubstubstubstubstubstubstubstubstub"
+      elif [[ "$*" == *" key list"* ]]; then
+          # restic marks the CURRENT key's row with '*' (own column).
+          echo ' ID        User  Host       Created'
+          echo '*deadbeef  root  stub-host  2026-01-01 00:00:00'
+      elif [[ "$*" == *" key add"* ]]; then
+          echo "saved new key"
+      elif [[ "$*" == *" key remove"* ]]; then
+          echo "removed key"
+      elif [[ "$*" == *" dump "*"--tag db"* ]]; then
+          # A fake db dump with a --master-data=2 anchor and the completion
+          # footer, so the guided restore can read the anchor and pass its
+          # footer check. STUB_DUMP_SOURCE_ANCHOR switches to the newer
+          # CHANGE REPLICATION SOURCE TO spelling (anchor-parser tests).
+          # STUB_DUMP_NO_ANCHOR omits the anchor entirely (a dump built without
+          # --master-data — the restore-drill PITR fail-closed test).
+          # Identity header (what the real backup writes as line 1);
+          # STUB_DUMP_NO_UUID models a pre-identity legacy dump.
+          if [[ -z "${STUB_DUMP_NO_UUID:-}" ]]; then
+              printf -- '-- carlos-server-uuid: %s\n' \
+                  "${STUB_DUMP_UUID:-${STUB_SERVER_UUID:-11111111-1111-1111-1111-111111111111}}"
+          fi
+          if [[ -n "${STUB_DUMP_NO_ANCHOR:-}" ]]; then
+              :   # no anchor line at all
+          elif [[ -n "${STUB_DUMP_SOURCE_ANCHOR:-}" ]]; then
+              printf -- "-- CHANGE REPLICATION SOURCE TO SOURCE_LOG_FILE='binlog.000007', SOURCE_LOG_POS=1234;\n"
+          else
+              printf -- "-- CHANGE MASTER TO MASTER_LOG_FILE='binlog.000007', MASTER_LOG_POS=1234;\n"
+          fi
+          # Real --all-databases shape: the `-- Current Database:` comment
+          # precedes CREATE DATABASE — the restore's drop-and-recreate
+          # injection keys off it, making the injected DROP e2e-observable.
+          printf -- '-- Current Database: `oscar`\n'
+          printf 'CREATE DATABASE IF NOT EXISTS oscar;\n'
+          printf -- '-- Dump completed on test\n'
+      elif [[ "$*" == *" ls latest"* ]]; then
+          if [[ -z "${STUB_LS_EMPTY:-}" ]]; then
+              echo /backup
+              if [[ "$*" == *"--tag docs"* ]]; then
+                  echo /backup/OscarDocument
+                  echo /backup/OscarDocument/doc1.pdf
+              else
+                  echo /backup/container
+                  echo /backup/container/conf/secrets/secrets.enc.yaml
+                  echo /backup/OscarDocument/doc1.pdf
+              fi
+          fi
+      elif [[ "$*" == *" restore "*"--target /restore-scratch/binlog"* ]]; then
+          # Materialize a fake binlog chain (from the dump's anchor
+          # binlog.000007) into the host dir bind-mounted at /restore-scratch,
+          # so the live restore's PITR replay branch actually runs. Without
+          # STUB_RESTORE_BINLOGS the restore is a no-op (empty chain), driving
+          # the base-dump-only refusal path instead.
+          #
+          # `restore latest` REQUIRED, like real restic: --host/--tag snapshot
+          # filters only apply when resolving 'latest'. Fetching the chain with
+          # an explicit snapshot ID was a real bug (it restored the DB dump
+          # into the binlog scratch and misread the anchor as pruned), so a
+          # non-latest chain fetch materializes nothing and the tests that
+          # expect a replay fail loudly.
+          if [[ -n "${STUB_RESTORE_BINLOGS:-}" && "$*" == *" restore latest "* ]]; then
+              prev="" host_scratch=""
+              for tok in "$@"; do
+                  [[ "$prev" == "-v" && "$tok" == *:/restore-scratch ]] \
+                      && host_scratch="${tok%:/restore-scratch}"
+                  prev="$tok"
+              done
+              if [[ -n "$host_scratch" ]]; then
+                  mkdir -p "$host_scratch/binlog/backup/binlog"
+                  : > "$host_scratch/binlog/backup/binlog/binlog.000007"
+                  : > "$host_scratch/binlog/backup/binlog/binlog.000008"
+                  # Chain-identity sidecar as ship_binlogs writes it;
+                  # STUB_CHAIN_NO_UUID models pre-identity legacy snapshots.
+                  if [[ -z "${STUB_CHAIN_NO_UUID:-}" ]]; then
+                      printf '%s\n' \
+                          "${STUB_CHAIN_UUID:-${STUB_SERVER_UUID:-11111111-1111-1111-1111-111111111111}}" \
+                          > "$host_scratch/binlog/backup/binlog/.carlos-server-identity"
+                  fi
+              fi
+          fi
+      elif [[ "$*" == *" certonly "* ]]; then
+          # acme cert-renew: STUB_CERTBOT_ISSUE materializes a "cert" into
+          # the mounted acme etc dir (STUB_CERT_SERIAL varies the content so
+          # not-due detection can be exercised); without it certbot "succeeds"
+          # but yields nothing — the fail-loud no-cert branch.
+          if [[ -n "${STUB_CERTBOT_ISSUE:-}" ]]; then
+              prev="" etcdir=""
+              for tok in "$@"; do
+                  [[ "$prev" == "-v" && "$tok" == *:/etc/letsencrypt ]] \
+                      && etcdir="${tok%:/etc/letsencrypt}"
+                  prev="$tok"
+              done
+              if [[ -n "$etcdir" ]]; then
+                  mkdir -p "$etcdir/live/emr.example.ca"
+                  printf 'STUB-CERT-%s\n' "${STUB_CERT_SERIAL:-1}" \
+                      > "$etcdir/live/emr.example.ca/fullchain.pem"
+                  printf 'STUB-KEY-%s\n' "${STUB_CERT_SERIAL:-1}" \
+                      > "$etcdir/live/emr.example.ca/privkey.pem"
+              fi
+          fi
+      elif [[ "$*" == *" cat config"* ]]; then
+          # rotate-restic's verify step re-opens the repo with the NEW
+          # password (forwarded by name); fail it on demand.
+          if [[ -n "${STUB_RESTIC_VERIFY_FAIL:-}" && " $* " == *" -e RESTIC_PASSWORD "* ]]; then
+              exit 1
+          fi
+          # Init-guard tests: fake restic's exit code for the repo probe
+          # (10 = "repository does not exist"; 1 = unreachable/bad password).
+          if [[ -n "${STUB_RESTIC_CAT_RC:-}" ]]; then
+              exit "$STUB_RESTIC_CAT_RC"
+          fi
+          echo '{"version":2}'
+      fi;;
+  "exec -i")
+      # cat only when stdin is not a tty — a tty would block forever and
+      # wedge the whole suite when run from an interactive terminal.
+      { echo "--- exec stdin:"; [ ! -t 0 ] && cat; } >> "$LOG"
+      # Boot-grace tests: fake a db-unreachable binlog probe on demand.
+      if [[ -n "${STUB_BINLOG_PROBE_FAIL:-}" && "$*" == *"@@log_bin"* ]]; then exit 1; fi
+      if [[ "$*" == *"@@log_bin"* ]]; then echo 1; fi
+      # Runtime binlog latch probe. `@@log_bin` above is only the STARTUP
+      # option: MariaDB turns logging off for the rest of the server process
+      # when it cannot open a new binlog file, and @@log_bin keeps reading 1.
+      # SHOW BINLOG STATUS returns one row while the binlog is OPEN and ZERO
+      # rows once it is closed (rc 0 either way — which is why an rc-only
+      # check misses it). STUB_BINLOG_CLOSED models the latched-off server;
+      # STUB_BINLOG_STATUS_UNSUPPORTED models a pre-11.4 server that only
+      # knows the SHOW MASTER STATUS spelling.
+      if [[ "$*" == *"SHOW BINLOG STATUS"* ]]; then
+          [[ -n "${STUB_BINLOG_STATUS_UNSUPPORTED:-}" ]] && exit 1
+          [[ -n "${STUB_BINLOG_CLOSED:-}" ]] || printf 'binlog.000002\t379\t\t\n'
+          exit 0
+      fi
+      if [[ "$*" == *"SHOW MASTER STATUS"* ]]; then
+          [[ -n "${STUB_BINLOG_PROBE_FAIL:-}" ]] && exit 1
+          [[ -n "${STUB_BINLOG_CLOSED:-}" ]] || printf 'binlog.000002\t379\t\t\n'
+          exit 0
+      fi
+      # Binlog chain identity (@@server_uuid, persisted in the datadir). ONE
+      # shared default across the probe, the fake restic dump header, and the
+      # restored chain sidecar, so existing cases stay identity-CONSISTENT;
+      # the identity tests override the individual knobs.
+      if [[ "$*" == *"@@server_uuid"* ]]; then
+          [[ -n "${STUB_UUID_PROBE_FAIL:-}" ]] && exit 1
+          echo "${STUB_SERVER_UUID:-11111111-1111-1111-1111-111111111111}"
+      fi
+      # Rollback's schema-compatibility fingerprint (oscar column inventory).
+      # STUB_SCHEMA_FP overrides the inventory (models a hand-applied
+      # migration); STUB_SCHEMA_PROBE_FAIL models an unreachable db.
+      if [[ "$*" == *"information_schema.columns"* ]]; then
+          [[ -n "${STUB_SCHEMA_PROBE_FAIL:-}" ]] && exit 1
+          printf '%s\n' "${STUB_SCHEMA_FP:-demographic	demographic_no	1	int}"
+      fi
+      # Non-InnoDB audit: report a MyISAM table on demand (fail-closed tests).
+      if [[ "$*" == *"engine <> 'InnoDB'"* ]]; then
+          # STUB_ENGINE_PROBE_FAIL: the information_schema audit query errors
+          # (the fail-closed-vs-swallow test); STUB_NONINNODB: it reports a
+          # MyISAM table.
+          [[ -n "${STUB_ENGINE_PROBE_FAIL:-}" ]] && exit 1
+          [[ -n "${STUB_NONINNODB:-}" ]] && echo "oscar.legacy [MyISAM]"
+          # STUB_ROURKE_ARIA: the KNOWN-unconvertible upstream table (1227
+          # columns, over InnoDB's 1017 limit). Set alongside STUB_NONINNODB
+          # to drive the MIXED case, which must still refuse.
+          [[ -n "${STUB_ROURKE_ARIA:-}" ]] && echo "oscar.formRourke2009 [Aria]"
+      fi
+      # A fake-but-complete dump so full-mode tests pass the staged-dump
+      # footer AND content-floor verification and reach the retention/check
+      # phase. STUB_DUMP_EMPTY keeps the footer but drops the content line
+      # (drives the empty-dump refusal).
+      if [[ "$*" == *mariadb-dump* ]]; then
+          [[ -z "${STUB_DUMP_EMPTY:-}" ]] && echo 'CREATE TABLE demographic (i int);'
+          echo '-- Dump completed on test'
+      fi;;
+  "unshare chown") : ;;   # userns chown of the exporter cnf — no-op, logged
+esac
+exit 0

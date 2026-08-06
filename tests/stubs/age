@@ -1,0 +1,8 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Test stub for age — carlos-ctl drives crypto through `sops` (which links the
+# age library), so this exists only so `command -v age` prereq checks pass and
+# to record any direct invocation.
+echo "age $*" >> "${STUBLOG:-/dev/null}"
+exit 0

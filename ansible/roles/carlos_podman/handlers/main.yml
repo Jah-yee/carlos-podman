@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+---
+- name: systemd daemon-reload
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: user daemon-reload
+  # Pod quadlets are USER units — reload the service user's manager, not the
+  # system one, or the generator never runs. -M <user>@ needs systemd >= 248.
+  ansible.builtin.command:
+    cmd: "systemctl --user -M {{ carlos_service_user }}@ daemon-reload"
+  changed_when: true

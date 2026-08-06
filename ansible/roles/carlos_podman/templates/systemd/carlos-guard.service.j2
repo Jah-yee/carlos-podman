@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Root system unit installed by the carlos-podman Ansible role to {{ carlos_instance }}-guard.service.
+# Boot-time blank-datadir guard: runs BEFORE the service user's manager starts
+# the carlos-app pod and fails loudly (paging via OnFailure=) when a DEPLOYED
+# instance's data volumes look unmounted or wiped — the reboot-path equivalent
+# of the `carlos-ctl play` datadir-signature check, which the Quadlet autostart
+# would otherwise bypass. The in-pod db-init container is the hard stop; this
+# unit is the detector that pages an operator. See `carlos-ctl guard` for the
+# checks and the CARLOS_ACCEPT_EMPTY_DATADIR / CARLOS_DOCS_MIN_FILES toggles.
+[Unit]
+Description=CARLOS EMR {{ carlos_instance }} boot guard (data volumes + host firewall before the pod starts)
+After=local-fs.target
+Wants=local-fs.target
+# Order after the nft apply so the guard's host-firewall verification (a
+# hostfw-enabled instance must have its inet {{ carlos_instance }}-hostfw
+# default-deny table LOADED — the nft unit itself is fail-open) never races
+# the boot-time ruleset load into a false page.
+After={{ carlos_instance }}-nft.service
+Wants={{ carlos_instance }}-nft.service
+# Order before the service user's manager so a failure is visible BEFORE the
+# Quadlet unit can start the pod over an unmounted volume (or an unfirewalled
+# host). Ordering only — a guard failure pages via OnFailure but never blocks
+# the boot itself.
+Before=user@{{ carlos_service_uid }}.service
+OnFailure={{ carlos_instance }}-alert@%n.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Type=oneshot defaults TimeoutStartSec to INFINITY. The guard only reads the
+# filesystem, but this unit is ordered Before=user@uid.service, so if EMR_HOME
+# sits on a stalled/stale network mount (NFS/EIO) an unbounded start would block
+# pod startup at boot indefinitely — and OnFailure= only fires on a run that
+# EXITS. Cap it so a wedged guard fails-and-pages instead of hanging the boot.
+TimeoutStartSec=2min
+# carlos-ctl reads the instance home from $EMR_HOME.
+Environment=EMR_HOME={{ carlos_emr_home }}
+ExecStart=/usr/local/sbin/carlos-ctl guard
+
+# Sandbox: the guard only READS under {{ carlos_emr_home }} and writes nothing. (Like the
+# nft/secrets root oneshots, and unlike the runuser-driven backup/monitor
+# units, NoNewPrivileges is safe here — no setuid transition.)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths={{ carlos_emr_home }}
+
+[Install]
+WantedBy=multi-user.target

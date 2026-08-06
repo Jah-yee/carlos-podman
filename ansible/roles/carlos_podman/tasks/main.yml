@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 CARLOS Contributors
+# Provision one CARLOS EMR instance, including rootless Podman pods, systemd
+# units, configuration, and credential scaffolding. The installed carlos-ctl
+# CLI manages runtime lifecycle operations.
+---
+- name: Validate configuration (within-instance + cross-instance collisions)
+  ansible.builtin.import_tasks: asserts.yml
+
+- name: Host base setup (service user, subuids, linger, journald)
+  ansible.builtin.import_tasks: host.yml
+
+- name: Install the carlos-ctl CLI
+  ansible.builtin.import_tasks: cli.yml
+
+- name: Provision the instance
+  ansible.builtin.import_tasks: instance.yml
+
+- name: Supersede/cleanup (bash-era artifacts, obs profile toggle-off)
+  ansible.builtin.import_tasks: cleanup.yml
+
+- name: Next steps
+  ansible.builtin.debug:
+    msg: >-
+      Instance '{{ carlos_instance }}' provisioned. Next:
+      (1) place TLS cert+key at {{ carlos_conf_dir }}/waf/certs/;
+      (2) sudo EMR_HOME={{ carlos_emr_home }} carlos-ctl build;
+      (3) carlos-ctl play && carlos-ctl check;
+      (4) carlos-ctl seal (and ESCROW the age key + restic.env OFF-HOST);
+      (5) load the DrugRef database (README, DrugRef).
