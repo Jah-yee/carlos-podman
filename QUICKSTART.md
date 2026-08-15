@@ -123,7 +123,7 @@ udev or device permissions if the check prints nothing.
 Clone this repository if you have not already done so:
 
 ```bash
-git clone https://github.com/yingbull/carlos-podman.git
+git clone https://github.com/carlos-emr/carlos-podman.git
 cd carlos-podman
 ```
 
@@ -386,7 +386,7 @@ ansible-galaxy collection install ansible.utils
 Clone the repository and create a working inventory:
 
 ```bash
-git clone https://github.com/yingbull/carlos-podman.git
+git clone https://github.com/carlos-emr/carlos-podman.git
 cd carlos-podman
 cp ansible/inventory.example ansible/inventory
 ```
